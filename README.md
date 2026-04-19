@@ -28,19 +28,44 @@ export PYTHONPATH=$PYTHONPATH:.
 | **MaskPPO** | 32 | **19,046** |
 | **Standard PPO** | 32 | **17,057** |
 
+## 📖 Documentation
+
+| Resource | Description |
+|---|---|
+| [Instructions.md](Instructions.md) | Setup, loading environments/agents, training, rendering, configuration |
+| [Architecture](ARCHITECTURE.md) | Deep-dive into the environment engine and algorithm stack |
+| [Contributing](CONTRIBUTING.md) | Coding standards, JIT rules, PR process, test expectations |
+| [Mechanics](JaxSC2/env/mechanics.md) | Physics equations: collisions, velocity integration, combat, fog of war |
+| [Unit Reference](JaxSC2/env/units.md) | Unit stats, weapons, type advantage matrix, design rationale |
+| [Map Authoring](JaxSC2/maps/README.md) | Map structure, variants, bridge strategy, creating custom maps |
+| [Test Suite](JaxSC2/tests/README.md) | Running tests, adding new tests, debugging JIT errors |
+| [Common Utilities](algorithms/common/README.md) | GAE, Welford RMS, action encoding, checkpointing |
+| [Visualizations](VISUALIZATIONS.md) | All demo scripts with CLI args, agent logic, customization guide |
+| [Algorithm READMEs](algorithms/README.md) | PPO, MaskPPO, A2C overview |
+
 ## 📖 Library Structure
 
 - `JaxSC2/`: Core environment engine.
-  - `env/`: Physics, base classes, and `JaxSC2Env`.
-  - `maps/`: Terrain constraints, rewards, and variants.
-  - `tests/`: Mechanics and integrity test suites.
-- `algorithms/`: Standardized RL implementations.
+  - `env/`: Physics, base classes, and `JaxSC2Env`. **See:** [mechanics.md](JaxSC2/env/mechanics.md), [units.md](JaxSC2/env/units.md)
+  - `maps/`: Terrain constraints, rewards, and variants. **See:** [map authoring guide](JaxSC2/maps/README.md)
+  - `tests/`: Mechanics and integrity test suites. **See:** [test suite guide](JaxSC2/tests/README.md)
+- `algorithms/`: Standardized RL implementations. **See:** [common utilities](algorithms/common/README.md)
   - `ppo/`: Proximal Policy Optimization.
   - `mask_ppo/`: PPO with invalid-action masking.
   - `a2c/`: Advantage Actor-Critic.
-  - `common/`: Shared utilities (GAE, RMS, Logging, Checkpointing).
 
 ## 🧪 Quick Start
+
+Ensure you have the dependencies installed:
+```bash
+pip install -r requirements.txt
+# or manually: pip install jax flax optax chex gymnasium pygame imageio matplotlib tensorboardX
+```
+
+Set up paths:
+```bash
+export PYTHONPATH=$PYTHONPATH:.
+```
 
 Run the PPO smoke test to verify JIT stability:
 ```bash
@@ -49,11 +74,27 @@ python algorithms/ppo/tests/test_ppo_jit.py
 
 Launch training:
 ```python
-from algorithms.ppo.trainer import PPOTrainer
-trainer = PPOTrainer({"VARIANT_NAME": "V1_Base"})
-trainer.train(total_steps=1000000)
+from algorithms.mask_ppo import MaskPPO
+from JaxSC2.env.env import JaxSC2Env
+
+config = {"NUM_ENVS": 32, "ROLLOUT_LEN": 512, "UPDATE_EPOCHS": 10}
+env = JaxSC2Env(variant_name="V1_Base")
+model = MaskPPO(config=config)
+model.train(env, total_steps=30_000_000)
 ```
+
+## 🎬 Visualizations
+
+Generate demo GIFs:
+```bash
+python JaxSC2/visualizations/render_demo.py        # Smart + chaos agent demos
+python JaxSC2/visualizations/demo_suite.py          # Full variant suite with CLI filters
+python JaxSC2/visualizations/run_ui.py              # Interactive Pygame window (press key to step)
+```
+
+See [VISUALIZATIONS.md](VISUALIZATIONS.md) for the full script reference.
 
 ## 🤝 Contributing
 
-See the individual `README.md` files in `JaxSC2/` and `algorithms/` for details on how to extend the environment or customize the RL logic.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for coding standards, the PR process, and test expectations.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a system-level overview before contributing.

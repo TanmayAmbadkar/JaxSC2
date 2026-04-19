@@ -1,0 +1,23 @@
+# JaxSC2 — Dependencies
+# Conda env: twobridge
+# Install: pip install -r requirements.txt
+
+# ── Core Framework ─────────────────────────────────────────────
+jax>=0.4.30
+flax>=0.8.0
+optax>=0.2.0
+
+# ── Type Safety / Assertions ───────────────────────────────────
+chex>=0.1.87
+
+# ── Gym Compatibility ─────────────────────────────────────────
+gymnasium>=0.29.0
+
+# ── Visualization & Rendering ─────────────────────────────────
+numpy>=1.26.0
+pygame>=2.5.0
+imageio>=2.34.0
+matplotlib>=3.8.0
+
+# ── Logging (TensorBoard) ─────────────────────────────────────
+tensorboardX>=2.6.0
