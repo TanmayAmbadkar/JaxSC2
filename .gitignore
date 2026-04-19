@@ -5,3 +5,5 @@ __pycache__
 CLAUDE.md
 runs/
 .rtk
+.sisyphus
+.opencode.json
