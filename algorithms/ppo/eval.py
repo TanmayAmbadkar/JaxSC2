@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from JaxSC2.env.twobridge import TwoBridgeEnv, CentralAction
+from JaxSC2.env.env import JaxSC2Env, CentralAction
 from algorithms.common.utils import flatten_obs, decode_action
 
 def evaluate(env, params, model, rng, num_episodes=32, max_steps=400):
@@ -22,7 +22,7 @@ def evaluate(env, params, model, rng, num_episodes=32, max_steps=400):
             
             verb, direction, target = decode_action(action_idx)
             action = CentralAction(
-                who_mask=jnp.ones((env.num_allies,), dtype=jnp.int32),
+                who_mask=jnp.ones((env.num_allies,), dtype=jnp.bool_),
                 verb=verb, direction=direction, target=target
             )
             

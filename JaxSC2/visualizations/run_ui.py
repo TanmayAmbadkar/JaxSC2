@@ -2,12 +2,12 @@ import jax
 import jax.random
 import jax.numpy as jnp
 import numpy as np
-from JaxSC2.env.twobridge import TwoBridgeEnv, CentralAction
+from JaxSC2.env.env import JaxSC2Env, CentralAction
 from JaxSC2.env.renderer import ProductionRenderer, state_to_frame
 
 def run_interactive_demo():
     print("Launching Interactive TwoBridge UI (Hunter Mode)...")
-    env = TwoBridgeEnv(variant_name="V2_Base", enemy_ai=True, enemy_mode="aggressive")
+    env = JaxSC2Env(variant_name="V2_Base", enemy_ai=True, enemy_mode="aggressive")
     rng = jax.random.PRNGKey(42)
     obs, state = env.reset(rng)
     

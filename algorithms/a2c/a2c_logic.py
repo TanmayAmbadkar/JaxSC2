@@ -2,19 +2,18 @@ import jax
 import jax.numpy as jnp
 
 def a2c_loss(params, apply_fn, obs, actions, advantages, returns, ent_coeff=0.01, vf_coeff=0.5):
+    """A2C loss - assumes advantages are already normalized outside."""
     logits, values = apply_fn(params, obs)
     
     logp = jax.nn.log_softmax(logits)
     logp_act = jnp.take_along_axis(logp, actions[:, None], axis=1).squeeze(-1)
 
-    # A2C Policy Loss: -E[logp * adv]
-    advantages = (advantages - jnp.mean(advantages)) / (jnp.std(advantages) + 1e-8)
+    # NOTE: advantages are normalized BEFORE calling this function (in the training loop)
+    
     policy_loss = -jnp.mean(logp_act * advantages)
     
-    # Value Loss (MSE)
     value_loss = jnp.mean((returns - values) ** 2)
     
-    # Entropy bonus
     probs = jax.nn.softmax(logits)
     entropy = -jnp.mean(jnp.sum(probs * logp, axis=-1))
 

@@ -1,10 +1,10 @@
 import jax
 import jax.numpy as jnp
 import pytest
-from JaxSC2.env.twobridge import TwoBridgeEnv, CentralAction
+from JaxSC2.env.env import JaxSC2Env, CentralAction
 
 def test_env_reset():
-    env = TwoBridgeEnv(variant_name="V1_Base")
+    env = JaxSC2Env(variant_name="V1_Base")
     rng = jax.random.PRNGKey(0)
     obs, state = env.reset(rng)
     
@@ -13,13 +13,13 @@ def test_env_reset():
     assert state.timestep == 0
 
 def test_env_step():
-    env = TwoBridgeEnv(variant_name="V1_Base")
+    env = JaxSC2Env(variant_name="V1_Base")
     rng = jax.random.PRNGKey(0)
     obs, state = env.reset(rng)
     
     # Simple no-op action
     action = CentralAction(
-        who_mask=jnp.ones(env.num_allies, dtype=jnp.int32),
+        who_mask=jnp.ones(env.num_allies, dtype=jnp.bool_),
         verb=0,
         direction=0,
         target=0
@@ -34,7 +34,7 @@ def test_env_step():
 
 @pytest.mark.parametrize("variant", ["V1_Base", "V2_Base", "V3_Base"])
 def test_all_variants(variant):
-    env = TwoBridgeEnv(variant_name=variant)
+    env = JaxSC2Env(variant_name=variant)
     rng = jax.random.PRNGKey(0)
     obs, state = env.reset(rng)
     assert state.smax_state.unit_positions.shape[0] == env.num_allies + env.num_enemies

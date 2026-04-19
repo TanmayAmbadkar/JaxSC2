@@ -1,37 +1,45 @@
 import jax
 import jax.numpy as jnp
-from algorithms.common.utils import flatten_obs, decode_action
-from JaxSC2.env.twobridge import CentralAction, get_action_masks
+from algorithms.common.utils import flatten_obs
+from JaxSC2.env.env import PerUnitAction, build_action_mask
 
 def evaluate(env, params, model, rng, num_episodes=16, max_steps=500):
     def run_episode(rng):
-        # Step logic
         def _step(carry, _):
             state, obs, total_reward, done, nav_flag, combat_flag, rng = carry
             
-            # Deterministic Action with Masking
             obs_flat = flatten_obs(obs)
-            mask = get_action_masks(state, env.num_allies)
-            logits, _ = model.apply(params, obs_flat, mask)
-            action_idx = jnp.argmax(logits, axis=-1)
             
-            verb, direction, target = decode_action(action_idx)
-            action = CentralAction(
-                who_mask=jnp.ones((env.num_allies,), dtype=jnp.int32),
-                verb=verb, direction=direction, target=target
+            # Multi-head policy with masking
+            output = model.apply(params, obs_flat)
+            verb_logits = output["verb_logits"]
+            direction_logits = output["direction_logits"]
+            target_logits = output["target_logits"]
+            
+            # Apply action masks
+            mask = build_action_mask(state, env.num_allies)
+            verb_logits = jnp.where(mask["verb"][:, :, None], verb_logits, -1e9)
+            
+            # Deterministic action (argmax)
+            verb_idx = jnp.argmax(verb_logits, axis=-1)[:, 0]
+            direction_idx = jnp.argmax(direction_logits, axis=-1)[:, 0]
+            target_idx = jnp.argmax(target_logits, axis=-1)[:, 0]
+            
+            action = PerUnitAction(
+                who_mask=jnp.ones((env.num_allies,), dtype=jnp.bool_),
+                verb=verb_idx[None, :],
+                direction=direction_idx[None, :],
+                target=target_idx[None, :],
             )
             
             rng, step_rng = jax.random.split(rng)
             next_obs, next_state, reward, new_done, info = env.step(step_rng, state, action)
             
-            # Masking
             reward = jnp.where(done, 0.0, reward)
             
-            # Nav/Combat Win Tracking (Guarded by ~done)
-            new_nav_flag = nav_flag | (info["nav_success"] & ~done)
-            new_combat_flag = combat_flag | (info["combat_success"] & ~done)
+            new_nav_flag = nav_flag | (info["beacon_reached"].astype(jnp.float32) & ~done)
+            new_combat_flag = combat_flag | (info["enemies_killed"].astype(jnp.float32) & ~done)
             
-            # Freeze state/obs
             next_state = jax.tree_util.tree_map(lambda a, b: jnp.where(done, a, b), state, next_state)
             next_obs = jnp.where(done, obs, next_obs)
             

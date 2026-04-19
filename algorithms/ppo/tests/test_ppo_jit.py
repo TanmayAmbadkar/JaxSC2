@@ -19,8 +19,8 @@ def test_ppo_jit_stability():
     tx = optax.adam(3e-4)
     state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
     
-    from JaxSC2.env.twobridge import TwoBridgeEnv
-    env = TwoBridgeEnv(variant_name="V1_Base")
+    from JaxSC2.env.env import JaxSC2Env
+    env = JaxSC2Env(variant_name="V1_Base")
     obs, env_state = jax.vmap(env.reset)(jax.random.split(rng, 4))
     from algorithms.common.utils import flatten_obs, RunningMeanStd
     obs_flat = flatten_obs(obs)

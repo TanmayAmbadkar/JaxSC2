@@ -5,7 +5,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import imageio
-from JaxSC2.env.twobridge import TwoBridgeEnv, CentralAction
+from JaxSC2.env.env import JaxSC2Env, CentralAction
 from JaxSC2.env.renderer import ProductionRenderer, state_to_frame
 
 def fig_to_array(fig):
@@ -32,7 +32,7 @@ def get_smart_direction(pos, target):
     return int(jnp.round(angle / (jnp.pi / 4)) % 8)
 
 def run_demonstration(variant="V2_Base", out_path="combat_nav.gif", out_spatial="spatial_obs.gif", mode="smart"):
-    env = TwoBridgeEnv(variant_name=variant, use_spatial_obs=True, resolution=64, enemy_ai=True, enemy_mode="aggressive")
+    env = JaxSC2Env(variant_name=variant, use_spatial_obs=True, resolution=64, enemy_ai=True, enemy_mode="aggressive")
     rng = jax.random.PRNGKey(42)
     obs, state = env.reset(rng)
     
