@@ -94,6 +94,26 @@ python JaxSC2/visualizations/run_ui.py              # Interactive Pygame window 
 
 See [VISUALIZATIONS.md](VISUALIZATIONS.md) for the full script reference.
 
+## 🎬 Showcase
+
+### Trained Agent — Combat (V2_Combat)
+
+A MaskPPO policy trained for 30M steps on V2_Combat (5v5). The agent demonstrates coordinated bridge crossing, composition-aware targeting (Melee→Ranged→Tank advantage exploitation), and projectile ballistics engagement.
+
+![Combat Demo](JaxSC2/assets/combat_demo.gif)
+
+### Navigation Variants (5v3 / 5v5 / 5v8)
+
+The agent navigates the TwoBridge map across three enemy-strength variants. Units route through the correct bridge based on spawn position, maintain formation during crossing, and reach the beacon even under heavy enemy pressure.
+
+| Variant | Strength | Description |
+|---|---|---|
+| **5v3 Navigate** | Light (3 enemies) | Quick bridge crossing, minimal engagement delay |
+| **5v5 Navigate** | Medium (5 enemies) | Split-force strategy: half units cross while others engage |
+| **5v8 Navigate** | Heavy (8 enemies) | Overwhelming numbers require timing — cross when enemy is committed elsewhere |
+
+> GIFs generated with `python JaxSC2/visualizations/demo_suite.py --mode navigate`
+
 ## 🤝 Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for coding standards, the PR process, and test expectations.

@@ -534,6 +534,15 @@ class JaxSC2Env:
         mean_dist = jnp.sum(dist_to_beacon * ally_alive_obs) / jnp.maximum(jnp.sum(ally_alive_obs), 1.0)
         nav_reward = (state.prev_mean_dist - mean_dist) * 2.0
         
+        # Combat shaping: bidirectional distance to enemy centroid (Panda et al., ICML 2026)
+        alive_enemy_float = enemy_alive_obs.astype(jnp.float32)
+        combat_centroid = jnp.sum(enemy_pos_obs * alive_enemy_float[:, None], axis=0) / jnp.maximum(jnp.sum(alive_enemy_float), 1.0)
+        dist_to_combat_centroid = (
+            jnp.sum(jnp.linalg.norm((ally_pos_obs - combat_centroid) / dims, axis=-1) * ally_alive_obs.astype(jnp.float32), axis=0)
+            / jnp.maximum(jnp.sum(ally_alive_obs.astype(jnp.float32)), 1.0)
+        )
+        combat_shaping = (state.prev_enemy_dist - dist_to_combat_centroid) * 0.5
+        
         # Combat Reward (HP Damage + Kills)
         current_enemy_hp = jnp.sum(next_hp[self.num_allies:] * enemy_alive_obs)
         enemy_dmg_reward = (state.prev_enemy_health - current_enemy_hp) * 0.01 * 0.5
@@ -544,14 +553,21 @@ class JaxSC2Env:
         # Kill Bonuses
         enemy_killed = (jnp.sum(state.smax_state.unit_alive[self.num_allies:]) - jnp.sum(enemy_alive_obs)) * 0.2
         
-        # Total Reward
-        total_reward = nav_reward + enemy_dmg_reward - ally_dmg_penalty + enemy_killed
+        # Total Reward (step-level)
+        total_reward = nav_reward + combat_shaping + enemy_dmg_reward - ally_dmg_penalty + enemy_killed
         
         # Termination
         beacon_reached = jnp.any((dist_to_beacon < 0.05) & ally_alive_obs)
         enemies_dead = jnp.sum(enemy_alive_obs) == 0
         allies_dead = jnp.sum(ally_alive_obs) == 0
         done = beacon_reached | enemies_dead | allies_dead | (state.timestep >= self.max_steps)
+        
+        # Terminal Rewards (Panda et al., ICML 2026)
+        terminal_reward = jnp.where(beacon_reached, 25.0,
+            jnp.where(enemies_dead, 10.0,
+                jnp.where(allies_dead, -10.0,
+                    jnp.where(done, -15.0, 0.0))))
+        total_reward = total_reward + terminal_reward
         
         # 11. Build Info
         info = {
@@ -560,7 +576,9 @@ class JaxSC2Env:
             "combat_success": enemies_dead,
             "enemies_killed": enemy_killed,
             "nav_reward": nav_reward,
+            "combat_shaping": combat_shaping,
             "combat_reward": enemy_dmg_reward - ally_dmg_penalty + enemy_killed,
+            "terminal_reward": terminal_reward,
         }
         
         # 12. Build Next State
@@ -581,7 +599,7 @@ class JaxSC2Env:
             prev_mean_dist=mean_dist,
             prev_enemy_health=current_enemy_hp,
             prev_ally_health=current_ally_hp,
-            prev_enemy_dist=state.prev_enemy_dist,
+            prev_enemy_dist=dist_to_combat_centroid,
             unit_velocities=next_vel,
             attack_timers=next_timers,
             persistent_targets=next_targets,

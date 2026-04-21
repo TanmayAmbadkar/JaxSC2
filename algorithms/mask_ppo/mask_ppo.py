@@ -20,9 +20,9 @@ class MaskPPO(BaseAlgorithm):
         default_config = {
             "NUM_ENVS": 32,
             "ROLLOUT_LEN": 512,
-            "UPDATE_EPOCHS": 10,
+            "UPDATE_EPOCHS": 5,
             "NUM_MINIBATCHES": 16,
-            "LR": 3e-4,
+            "LR": 2e-4,
             "CLIP_EPS": 0.2,
             "GAMMA": 0.995,
             "GAE_LAMBDA": 0.95,

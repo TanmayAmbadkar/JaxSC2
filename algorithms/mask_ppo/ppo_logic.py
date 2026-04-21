@@ -14,8 +14,6 @@ def masked_ppo_loss(params, apply_fn, obs, action_indices, old_logp,
     ratio = jnp.exp(logp_act - old_logp)
     clipped = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps)
 
-    advantages = (advantages - jnp.mean(advantages)) / (jnp.std(advantages) + 1e-8)
-
     policy_loss = -jnp.mean(jnp.minimum(ratio * advantages, clipped * advantages))
     value_loss = jnp.mean((returns - value) ** 2)
 
@@ -75,7 +73,8 @@ def masked_ppo_loss_multih(params, apply_fn, obs,
     ratio = jnp.exp(new_logp - old_logp)
     clipped = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps)
 
-    advantages = (advantages - jnp.mean(advantages)) / (jnp.std(advantages) + 1e-8)
+    # NOTE: advantages are normalized BEFORE calling this function (in the training loop)
+    # to ensure consistent normalization across all minibatches
 
     policy_loss = -jnp.mean(jnp.minimum(ratio * advantages, clipped * advantages))
     value_loss = jnp.mean((returns - value) ** 2)
