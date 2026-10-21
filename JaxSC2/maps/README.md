@@ -8,15 +8,15 @@ This directory contains the logic governing environmental layouts, reward shapin
 
 ### Layout Overview
 
-The default map is a **32×32 grid** with a vertical cliff wall at x=0.5 (normalized) that splits the map into left (ally) and right (enemy) halves. Units must cross through one of two bridges to reach the other side.
+The default map is a **32×32 grid** with a ditch spanning x=(0.45–0.55), or x=14.4–17.6 in world coordinates. Both armies must cross through one of two bridges. Collision geometry, spatial features, rendering, and scripted routing share the constants in `TwoBridgeMap`.
 
 ### Terrain Features
 
 | Feature | Position (normalized) | Position (32×32 grid) | Effect |
 |---|---|---|---|
-| **Cliff wall** | x = 0.5 | x = 16 (full height) | Blocks all movement except at bridge gaps |
-| **Bridge 1** | y ∈ (0.2, 0.3) | y = 6–10 | Allows passage through cliff wall |
-| **Bridge 2** | y ∈ (0.7, 0.8) | y = 22–26 | Allows passage through cliff wall |
+| **Ditch** | x ∈ (0.45, 0.55) | x = 14.4–17.6 | Blocks both teams except at bridge gaps |
+| **Bridge 1** | y ∈ (0.2, 0.3) | y = 6.4–9.6 | Unit centers need radius clearance from both edges |
+| **Bridge 2** | y ∈ (0.7, 0.8) | y = 22.4–25.6 | Unit centers need radius clearance from both edges |
 | **Ally spawn regions** | 6 boxes on left half (x < 0.5) | x ∈ [0, 16) | Procedural spawn within these boxes |
 | **Enemy spawn regions** | 6 boxes on right half (x > 0.5) | x ∈ [16, 32] | Procedural spawn within these boxes |
 | **Beacon** | Right half, near center | ~ (x>16, y≈16) | Navigation target for ally units |
@@ -68,7 +68,7 @@ The two-bridge design creates natural choke points that agents must learn to exp
 3. **Bridge denial**: Holding one bridge while attacking through the other forces the enemy to split their response
 4. **Leash on bridges**: Units cluster at bridge exits after crossing, making them vulnerable to focused fire
 
-The `enforce_bridge_terrain` function only constrains **ally** units (not enemies). Enemies can move through the cliff freely, simulating map asymmetry where allies must follow terrain while enemies have open movement (or this is a design choice for training difficulty).
+`TwoBridgeMap.enforce_constraints` constrains both teams, including position changes caused by unit collisions. Scripted agents stay inside a bridge corridor until their full footprint has cleared the opposite bank.
 
 ---
 
@@ -120,34 +120,29 @@ An episode ends (and returns a done flag) when **any** of these conditions is me
 
 ---
 
-## 🚧 Constraints (`enforce_bridge_terrain`)
+## 🚧 Constraints (`TwoBridgeMap.enforce_constraints`)
 
-### How Bridge Enforcement Works
+The ditch is the union of three rectangles between x=14.4 and 17.6, separated
+by the two bridge openings. `DITCH_X` and `BRIDGE_Y` define this footprint for
+physics, rendering and spatial feature layers.
 
-The function `enforce_bridge_terrain` (implemented in the environment step loop, not a separate module) uses **segment-crossing detection** to prevent units from moving through the cliff wall:
+For movement, each rectangle is expanded by the unit radius. This conservative
+clearance also covers corners. A radius-0.6 unit can cross the lower bridge with
+its center at y=7.0–9.0, and the upper bridge at y=23.0–25.0.
 
-```python
-for each unit:
-    prev_x = old_position.x
-    new_x = new_position.x
+The solver sweeps the whole requested displacement against these expanded
+rectangles, stops at first contact, removes inward displacement, and slides along
+the edge. World bounds also include radius clearance. Both armies obey these
+constraints even when unit-to-unit collision resolution is disabled.
 
-    if (prev_x < 16 and new_x > 16) or (prev_x > 16 and new_x < 16):
-        # Unit crossed the cliff boundary (x=16 in 32×32 grid)
-        bridge_y = get_bridge_y_for_unit(unit.current_y)  # Which bridge is this unit near?
-        if not in_bridge_range(unit.current_y, bridge_y):
-            # Not within a bridge gap — reject the movement
-            unit.position = clamp_to_bridge_side(prev_x, unit.current_y)
-```
+The environment applies terrain constraints after resolving unit collisions,
+then removes velocity components rejected by terrain. Scripted routing keeps its
+bridge waypoint until the unit has fully exited the ditch, rather than turning
+as soon as it crosses x=16.
 
-**Key implementation details:**
-- The cliff is at grid column x=16 (normalized 0.5 × resolution).
-- Bridge detection checks if the unit's y-coordinate is within ±2 grid units of either bridge center.
-- If movement crosses the cliff AND isn't near a bridge, the position is "clamped" to prevent crossing.
-- **Only ally units are constrained.** Enemy movement is not checked against bridges (this creates an asymmetry that increases training difficulty — enemies can reposition freely while allies must plan bridge crossings).
-
-### Cliff Collision Penalty
-
-In addition to blocking movement, units that are *on* cliff tiles (x=16 and not in bridge range) receive a small negative reward each step they remain there. This prevents agents from "backing up" against the cliff wall as a defensive strategy.
+`is_walkable` checks complete unit clearance. Scripted evaluations record
+`terrain_valid` and `terrain_violations` separately from objective success.
+There is no additional cliff-contact penalty in the reward function.
 
 ---
 
@@ -184,14 +179,16 @@ Each box should contain at least one valid spawn position. The environment will 
 #### 3. Define the Cliff (if any)
 
 ```python
-CLIFF_X = 0.5              # Normalized x position of cliff wall (None for no cliff)
-BRIDGES = [                 # List of (y_min, y_max) for each bridge gap
+DITCH_X = (0.45, 0.55)     # Normalized near and far banks
+BRIDGE_Y = (              # Exactly two (y_min, y_max) bridge openings
     (0.3, 0.4),             # Bridge 1 at y=30%-40%
     (0.6, 0.7),             # Bridge 2 at y=60%-70%
-]
+)
 ```
 
-Set `CLIFF_X = None` if you want an open map with no bridge constraints.
+These class attributes are shared by terrain physics, features, rendering, and
+routing. For an open map, provide a map implementation with no obstacle
+rectangles and a corresponding constraint method.
 
 #### 4. Define the Beacon Position
 
@@ -216,10 +213,10 @@ ALL_VARIANTS = {
 
 #### 6. Update Enforcer Logic (if needed)
 
-If your map has different terrain features (e.g., multiple cliffs, circular bridges), modify the `enforce_bridge_terrain` function in `env.py`. The key contract is:
+If your map has different terrain features (e.g., multiple ditches or curved bridges), implement the corresponding geometry and `enforce_constraints` method on the map. The key contract is:
 
-- Input: unit position, previous position
-- Output: adjusted position (if movement is blocked) or original position
+- Input: proposed positions, previous positions, map dimensions, teams, and radii
+- Output: adjusted positions with valid swept paths and complete unit clearance
 
 ---
 

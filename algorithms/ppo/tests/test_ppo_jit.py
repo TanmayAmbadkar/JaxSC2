@@ -1,39 +1,30 @@
-import jax
-import jax.numpy as jnp
-import optax
-from algorithms.ppo.trainer import PPOTrainer
-from algorithms.ppo.model import ActorCritic
-from flax.training.train_state import TrainState
+"""The rollout/update graph should compile once across consecutive updates."""
 
-def test_ppo_jit_stability():
-    """
-    Verifies that PPOTrainer.train_iteration is JIT-stable and doesn't retrace.
-    """
-    trainer = PPOTrainer({"NUM_ENVS": 4, "ROLLOUT_LEN": 16})
-    config = trainer.config
-    
-    # Setup state
-    rng = jax.random.PRNGKey(0)
-    model = ActorCritic(action_dim=17)
-    params = model.init(rng, jnp.zeros((1, 63)))
-    tx = optax.adam(3e-4)
-    state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
-    
-    from JaxSC2.env.env import JaxSC2Env
-    env = JaxSC2Env(variant_name="V1_Base")
-    obs, env_state = jax.vmap(env.reset)(jax.random.split(rng, 4))
-    from algorithms.common.utils import flatten_obs, RunningMeanStd
-    obs_flat = flatten_obs(obs)
-    rms = RunningMeanStd(mean=jnp.zeros(1), var=jnp.ones(1), count=jnp.array(1e-4))
-    
-    # Get the train_iteration function
-    # Note: It's defined inside trainer.train, so we need a way to access it 
-    # for testing. Or we test the trainer.train performance.
-    # Refactoring suggestion: Move train_iteration to a class method or static method.
-    pass
+from JaxSC2.env.env import JaxSC2Env
+from algorithms.ppo.trainer import PPOTrainer
+
+
+def test_ppo_jit_stability(tmp_path):
+    class CountTracesEnv(JaxSC2Env):
+        trace_count = 0
+
+        def step(self, key, state, action):
+            self.trace_count += 1
+            return super().step(key, state, action)
+
+    trainer = PPOTrainer({
+        "NUM_ENVS": 2, "ROLLOUT_LEN": 4, "UPDATE_EPOCHS": 1,
+        "NUM_MINIBATCHES": 1, "LOG_DIR": str(tmp_path / "logs"),
+    })
+    trainer.env = CountTracesEnv("V1_Base")
+    trainer.train(16)
+    assert int(trainer.state.step) == 2
+    assert trainer.env.trace_count == 1
+
 
 if __name__ == "__main__":
-    # For now, let's just run a smoke test iteration
-    trainer = PPOTrainer({"NUM_ENVS": 4, "ROLLOUT_LEN": 16, "UPDATE_EPOCHS": 1, "NUM_MINIBATCHES": 1})
-    trainer.train(4 * 16) # Exactly one iteration
+    trainer = PPOTrainer({
+        "NUM_ENVS": 4, "ROLLOUT_LEN": 16, "UPDATE_EPOCHS": 1, "NUM_MINIBATCHES": 1,
+    })
+    trainer.train(4 * 16)
     print("PPO Smoke Test Passed")

@@ -223,10 +223,11 @@ def test_timeout_terminal():
     )
     
     state_c = state
+    step = jax.jit(env.step)
     terminated_at_step = None
     for i in range(305):  # Test a few beyond max_steps to confirm termination
         rng_i, rng_state = jax.random.split(jax.random.PRNGKey(i + 50))
-        obs_c, state_c, r, d, info = env.step(rng_state, state_c, action)
+        obs_c, state_c, r, d, info = step(rng_state, state_c, action)
         if jnp.any(d):
             terminated_at_step = i + 1
             break

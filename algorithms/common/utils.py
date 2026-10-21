@@ -22,7 +22,7 @@ def update_rms(rms: RunningMeanStd, x: jnp.ndarray) -> RunningMeanStd:
     delta = batch_mean - rms.mean
     new_mean = rms.mean + delta * batch_count / jnp.maximum(total_count, 1.0)
     
-    m_a = rms.var * jnp.maximum(rms.count, 1.0)
+    m_a = rms.var * rms.count
     M2 = m_a + batch_m2 + jnp.square(delta) * rms.count * batch_count / jnp.maximum(total_count, 1.0)
     new_var = M2 / jnp.maximum(total_count, 1.0)
     
@@ -77,14 +77,14 @@ def decode_action(action_idx):
 def encode_per_unit_action(verb, direction, target):
     """Pack per-unit action arrays into a single flat index for storage.
     
-    Usage: Index = verb + 3 * direction + 3 * 8 * target
-    Range: [0, 3*8*num_targets)
+    Usage: Index = verb + 3 * direction + 3 * 8 * (target + 1)
+    Range: [0, 3*8*(num_targets+1))
     
     verb: (N,) int32 in [0, 3]
     direction: (N,) int32 in [0, 8]  
-    target: (N,) int32 in [-1, num_targets-1], -1 maps to 0
+    target: (N,) int32 in [-1, num_targets-1], with a distinct no-target slot
     """
-    target_packed = jnp.clip(target, 0, None)  # -1 -> 0 (not needed for loss, just storage)
+    target_packed = jnp.maximum(target + 1, 0)
     return verb + 3 * direction + 3 * 8 * target_packed
 
 def decode_per_unit_action(flat_idx, num_targets):
@@ -98,5 +98,5 @@ def decode_per_unit_action(flat_idx, num_targets):
     rem = rem // 3
     direction = rem % 8
     target_packed = rem // 8
-    target = jnp.where(target_packed == 0, -1, target_packed)
+    target = jnp.clip(target_packed - 1, -1, num_targets - 1)
     return verb.astype(jnp.int32), direction.astype(jnp.int32), target.astype(jnp.int32)

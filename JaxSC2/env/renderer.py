@@ -2,6 +2,7 @@ import pygame
 import numpy as np
 import os
 import imageio
+from JaxSC2.maps.twobridge import TwoBridgeMap
 
 # SC2-Inspired Color Palette (V10)
 COLOR_GRASS = (20, 45, 20)
@@ -18,11 +19,12 @@ def lerp(a, b, t):
 
 class ProductionRenderer:
     """ Unified Production Renderer with locked camera and 60fps output. """
-    def __init__(self, headless=True, trails_enabled=True, width=800, height=800, map_dims=(32, 32)):
+    def __init__(self, headless=True, trails_enabled=True, width=800, height=800, map_dims=(32, 32), terrain=None):
         self.headless = headless
         self.trails_enabled = trails_enabled
         self.width, self.height = width, height
         self.map_w, self.map_h = map_dims
+        self.terrain = terrain if terrain is not None else TwoBridgeMap()
         # Always set SDL_VIDEODRIVER before pygame.init() to avoid hangs
         if not os.environ.get('SDL_VIDEODRIVER'):
             os.environ['SDL_VIDEODRIVER'] = 'dummy' if headless else ''
@@ -65,14 +67,19 @@ class ProductionRenderer:
             pygame.draw.line(self.terrain_surf, COLOR_GRID, (x,0), (x,self.height))
             y = self.world_to_screen((0, i), cam_pos, zoom)[1]
             pygame.draw.line(self.terrain_surf, COLOR_GRID, (0,y), (self.width,y))
-        f1 = self.world_to_screen((0.45*32, 0), cam_pos, zoom, z=-0.5)[0]
-        f2 = self.world_to_screen((0.55*32, 0), cam_pos, zoom, z=-0.5)[0]
-        pygame.draw.rect(self.terrain_surf, (0,0,0), (f1,0, f2-f1, self.height))
-        for yr in [(0.15, 0.35), (0.65, 0.85)]:
-            pts = [self.world_to_screen((0.45*32, yr[0]*32), cam_pos, zoom),
-                   self.world_to_screen((0.55*32, yr[0]*32), cam_pos, zoom),
-                   self.world_to_screen((0.55*32, yr[1]*32), cam_pos, zoom),
-                   self.world_to_screen((0.45*32, yr[1]*32), cam_pos, zoom)]
+        for x0, y0, x1, y1 in np.asarray(self.terrain.obstacle_rectangles(self.map_w, self.map_h)):
+            pts = [self.world_to_screen((x0, y0), cam_pos, zoom),
+                   self.world_to_screen((x1, y0), cam_pos, zoom),
+                   self.world_to_screen((x1, y1), cam_pos, zoom),
+                   self.world_to_screen((x0, y1), cam_pos, zoom)]
+            pygame.draw.polygon(self.terrain_surf, COLOR_CLIFF, pts)
+        x0, x1 = np.asarray(self.terrain.DITCH_X) * self.map_w
+        for lower, upper in self.terrain.BRIDGE_Y:
+            y0, y1 = lower * self.map_h, upper * self.map_h
+            pts = [self.world_to_screen((x0, y0), cam_pos, zoom),
+                   self.world_to_screen((x1, y0), cam_pos, zoom),
+                   self.world_to_screen((x1, y1), cam_pos, zoom),
+                   self.world_to_screen((x0, y1), cam_pos, zoom)]
             pygame.draw.polygon(self.terrain_surf, COLOR_BRIDGE, pts)
         self.cached_cam, self.cached_zoom = np.copy(cam_pos), zoom
 
@@ -127,25 +134,34 @@ class ProductionRenderer:
             if not f2["unit_alive"][t_idx]:
                 continue
             p1, p2 = self.world_to_screen(pos[i], cp, zm), self.world_to_screen(pos[t_idx], cp, zm)
-            nr = np.linalg.norm(pos[i] - pos[t_idx]) < 7.0 
+            attack_range = [1.5, 6.0, 4.0][f2["unit_types"][i]]
+            nr = np.linalg.norm(pos[i] - pos[t_idx]) < attack_range + .3
+            if not nr or f2["attack_timers"][i] == 0:
+                continue
             color = (130, 180, 255) if i < 5 else (255, 130, 130)
             a, w = (150, 3) if nr else (50, 1)
             pygame.draw.line(self.screen, (*color, a), p1, p2, w)
         
         # Draw units with health bars
-        r_map, hp1, hp2 = [12, 10, 18], f1["unit_health"], f2["unit_health"]
+        hp1, hp2 = f1["unit_health"], f2["unit_health"]
         for i in range(len(pos)):
             is_d = f1["unit_alive"][i] and not f2["unit_alive"][i]
             if not f2["unit_alive"][i] and not is_d:
                 continue
             sx, sy = self.world_to_screen(pos[i], cp, zm)
-            r = int(r_map[f2["unit_types"][i]] * (1.0-alpha if is_d else 1.0))
+            physical_radius = f2.get("unit_radius", np.full(len(pos), .6))[i]
+            r = max(1, int(physical_radius * (self.width / self.map_w) * zm
+                           * (1.0-alpha if is_d else 1.0)))
             pygame.draw.ellipse(self.screen, (0, 0, 0, 120), (sx-r, sy-r*0.3, r*2, r*0.6))
-            bx, by = self.world_to_screen(pos[i], cp, zm, z=0.1)
+            bx, by = self.world_to_screen(pos[i], cp, zm)
             ua = 255 if not is_d else int(255*(1-alpha))
-            pygame.draw.circle(self.screen, (*(COLOR_ALLY if i<5 else COLOR_ENEMY), ua), (bx, by), r)
-            pygame.draw.circle(self.screen, (255, 255, 255, int(40*(ua/255))), (bx-r//3, by-r//3), r//2)
-            pygame.draw.circle(self.screen, (0, 0, 0, ua), (bx, by), r, 2)
+            # Match the physical footprint and the world's y projection. Oversized
+            # decorative circles otherwise appear to hang over valid bridge edges.
+            ry = max(1, int(r * .7))
+            footprint = (bx-r, by-ry, r*2, ry*2)
+            pygame.draw.ellipse(self.screen, (*(COLOR_ALLY if i<5 else COLOR_ENEMY), ua), footprint)
+            pygame.draw.ellipse(self.screen, (0, 0, 0, ua), footprint, 1)
+            pygame.draw.circle(self.screen, (255, 255, 255, ua), (bx, by), max(1, r//4))
             if hp2[i] < hp1[i] and alpha < 0.5:
                 pygame.draw.circle(self.screen, (255, 255, 255), (bx, by), r+2)
             if not is_d:
@@ -236,6 +252,7 @@ def state_to_frame(state):
         "unit_alive": np.array(s.unit_alive, dtype=bool),
         "unit_health": np.array(s.unit_health),
         "unit_types": np.array(s.unit_types),
+        "unit_radius": np.full(len(s.unit_types), .6),
         "targets": np.array(state.persistent_targets),
         "attack_timers": np.array(state.attack_timers),
         "proj_pos": np.array(state.proj_pos),

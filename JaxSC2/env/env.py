@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import chex
 import gymnasium as gym
+import numpy as np
 from typing import Tuple, Dict, Union, Any, Optional
 from flax.struct import dataclass
 
@@ -13,6 +14,7 @@ from JaxSC2.env.mechanics import (
     integrate_velocity,
     update_persistent_targets,
     update_fog_memory, 
+    compute_visibility,
     apply_high_fidelity_combat,
     FogState
 )
@@ -23,6 +25,7 @@ class ActionBuffer:
     verbs: jnp.ndarray      # (delay, N) - per-unit actions per delay slot
     directions: jnp.ndarray # (delay,)
     targets: jnp.ndarray    # (delay,)
+    who_masks: jnp.ndarray  # (delay, N)
 
 @dataclass
 class JaxSC2State:
@@ -41,6 +44,7 @@ class JaxSC2State:
     proj_damage: jnp.ndarray
     proj_active: jnp.ndarray
     proj_team: jnp.ndarray
+    proj_types: jnp.ndarray
     fog_state: FogState
     action_buffer: ActionBuffer
     enemy_visible: jnp.ndarray # (num_enemies,)
@@ -51,24 +55,27 @@ def init_action_buffer(delay, num_units):
         verbs=jnp.zeros((delay, num_units), dtype=jnp.int32),
         directions=jnp.zeros((delay, num_units), dtype=jnp.int32),
         targets=jnp.zeros((delay, num_units), dtype=jnp.int32),
+        who_masks=jnp.zeros((delay, num_units), dtype=jnp.bool_),
     )
 
 def push_and_pop_actions(buffer: ActionBuffer, new_action):
     verbs = jnp.roll(buffer.verbs, shift=-1, axis=0)
     dirs  = jnp.roll(buffer.directions, shift=-1, axis=0)
     targs = jnp.roll(buffer.targets, shift=-1, axis=0)
+    who = jnp.roll(buffer.who_masks, shift=-1, axis=0)
 
     verbs = verbs.at[-1].set(new_action.verb)
     dirs  = dirs.at[-1].set(new_action.direction)
     targs = targs.at[-1].set(new_action.target)
+    who = who.at[-1].set(new_action.who_mask)
 
     exec_action = PerUnitAction(
-        who_mask=new_action.who_mask,
+        who_mask=who[0],
         verb=verbs[0],
         direction=dirs[0],
         target=targs[0],
     )
-    return ActionBuffer(verbs, dirs, targs), exec_action
+    return ActionBuffer(verbs, dirs, targs, who), exec_action
 
 @dataclass(frozen=True)
 class PerUnitAction:
@@ -76,6 +83,17 @@ class PerUnitAction:
     verb: jnp.ndarray       # Shape: (N,) - 0: NO_OP, 1: MOVE, 2: ATTACK
     direction: jnp.ndarray  # Shape: (N,) - 0-7 cardinal/intercardinal directions
     target: jnp.ndarray     # Shape: (N,) - 0 to (num_enemies-1), -1 = no target
+
+
+def CentralAction(who_mask, verb, direction, target):
+    """Compatibility constructor broadcasting an army command to selected units."""
+    who_mask = jnp.asarray(who_mask, dtype=jnp.bool_)
+    return PerUnitAction(
+        who_mask,
+        jnp.broadcast_to(jnp.asarray(verb, dtype=jnp.int32), who_mask.shape),
+        jnp.broadcast_to(jnp.asarray(direction, dtype=jnp.int32), who_mask.shape),
+        jnp.broadcast_to(jnp.asarray(target, dtype=jnp.int32), who_mask.shape),
+    )
 
 def build_action_mask(state: JaxSC2State, num_allies: int) -> Dict[str, jnp.ndarray]:
     """
@@ -99,13 +117,13 @@ def build_action_mask(state: JaxSC2State, num_allies: int) -> Dict[str, jnp.ndar
         jnp.zeros(num_allies, dtype=jnp.bool_)  # ATTACK - refined below
     ], axis=-1)
     
-    # Attack validity: only valid if at least one enemy exists
+    # Attack requires a visible, living enemy and a living attacker.
     enemy_alive = s.unit_alive[num_allies:]
-    any_enemy_alive = jnp.any(enemy_alive)
+    any_enemy_alive = jnp.any(enemy_alive & state.enemy_visible)
     attack_valid = jnp.where(any_enemy_alive, 
                              jnp.ones(num_allies, dtype=jnp.bool_),
                              jnp.zeros(num_allies, dtype=jnp.bool_))
-    verb_mask = verb_mask.at[:, 2].set(attack_valid)
+    verb_mask = verb_mask.at[:, 2].set(attack_valid & ally_alive)
     
     # Direction masks (N, 8) - always valid if alive
     direction_mask = jnp.tile(ally_alive[:, None], (1, 8))
@@ -189,7 +207,6 @@ class JaxSC2Env:
         self.map_height = self.smax_env.map_height
         self.map_dimensions = jnp.array([self.map_width, self.map_height])
         
-        # Team indices for combat engine (0: Ally, 1: Enemy)
         self.unit_teams = jnp.concatenate([
             jnp.zeros(self.num_allies, dtype=jnp.int32),
             jnp.ones(self.num_enemies, dtype=jnp.int32)
@@ -263,22 +280,21 @@ class JaxSC2Env:
         return jnp.where(count > 0, sum_pos / jnp.maximum(count, 1.0), jnp.zeros(2))
 
     def reset(self, rng: chex.PRNGKey) -> Tuple[Union[jnp.ndarray, Dict], JaxSC2State]:
-        rng_ally_region, rng_enemy_region, rng_beacon_region = jax.random.split(rng, 3)
-        rng_ally_pos, rng_enemy_pos, rng_beacon_pos = jax.random.split(rng, 3)
+        rng_region, rng_ally_pos, rng_enemy_pos, rng_beacon_pos = jax.random.split(rng, 4)
         
         # 1. JIT-Compilable Region Selection (No Overlap)
         a_global_idx, e_global_idx, b_global_idx = self.map_instance.get_spawn_regions(
-            rng_ally_region, 
+            rng_region,
             self.variant_config.layout_type
         )
         
         # 2. Sample dense clusters (Centroid + small offset)
         def sample_dense(rng, g_idx, num):
-            rng_c, rng_o = jax.random.split(rng)
+            rng_x, rng_y, rng_o = jax.random.split(rng, 3)
             bounds = self.map_instance.REGION_COORDS[g_idx]
             
-            cx = jax.random.uniform(rng_c, (), minval=(bounds[0]+0.05)*self.map_width, maxval=(bounds[1]-0.05)*self.map_width)
-            cy = jax.random.uniform(rng_c, (), minval=(bounds[2]+0.05)*self.map_height, maxval=(bounds[3]-0.05)*self.map_height)
+            cx = jax.random.uniform(rng_x, (), minval=(bounds[0]+0.05)*self.map_width, maxval=(bounds[1]-0.05)*self.map_width)
+            cy = jax.random.uniform(rng_y, (), minval=(bounds[2]+0.05)*self.map_height, maxval=(bounds[3]-0.05)*self.map_height)
             
             offsets = jax.random.uniform(rng_o, (num, 2), minval=-1.5, maxval=1.5)
             pos = jnp.stack([cx, cy], axis=-1) + offsets
@@ -288,8 +304,9 @@ class JaxSC2Env:
         enemy_pos = sample_dense(rng_enemy_pos, e_global_idx, self.num_enemies)
         
         bounds_b = self.map_instance.REGION_COORDS[b_global_idx]
-        bx = jax.random.uniform(rng_beacon_pos, (), minval=bounds_b[0]*self.map_width, maxval=bounds_b[1]*self.map_width)
-        by = jax.random.uniform(rng_beacon_pos, (), minval=bounds_b[2]*self.map_height, maxval=bounds_b[3]*self.map_height)
+        rng_bx, rng_by = jax.random.split(rng_beacon_pos)
+        bx = jax.random.uniform(rng_bx, (), minval=bounds_b[0]*self.map_width, maxval=bounds_b[1]*self.map_width)
+        by = jax.random.uniform(rng_by, (), minval=bounds_b[2]*self.map_height, maxval=bounds_b[3]*self.map_height)
         beacon_pos = jnp.array([bx, by])
         
         # 3. Construct SMAX State
@@ -320,11 +337,14 @@ class JaxSC2Env:
         initial_mean_dist = jnp.mean(jnp.linalg.norm((ally_pos - beacon_pos) / self.map_dimensions, axis=-1))
         initial_enemy_dist = jnp.mean(jnp.linalg.norm((ally_pos - jnp.mean(enemy_pos, axis=0)) / self.map_dimensions, axis=-1))
         
+        visible = (compute_visibility(ally_pos, smax_state.unit_alive[:self.num_allies],
+                                      enemy_pos, self.vision_radius)
+                   if self.enable_fow else jnp.ones(self.num_enemies, dtype=jnp.bool_))
         fog_state = FogState(
-            last_seen_pos=enemy_pos,
-            last_seen_alive=jnp.ones(self.num_enemies, dtype=jnp.bool_),
-            last_seen_hp=smax_state.unit_health[self.num_allies:],
-            last_seen_time=jnp.zeros(self.num_enemies, dtype=jnp.int32)
+            last_seen_pos=jnp.where(visible[:, None], enemy_pos, 0.),
+            last_seen_alive=visible,
+            last_seen_hp=jnp.where(visible, smax_state.unit_health[self.num_allies:], 0.),
+            last_seen_time=jnp.where(visible, 0, -1).astype(jnp.int32),
         )
         action_buffer = init_action_buffer(max(1, self.latency_delay), self.num_allies)
 
@@ -344,9 +364,10 @@ class JaxSC2Env:
             proj_damage=jnp.zeros(32),
             proj_active=jnp.zeros(32, dtype=jnp.bool_),
             proj_team=jnp.zeros(32, dtype=jnp.int32),
+            proj_types=jnp.full(32, -1, dtype=jnp.int32),
             fog_state=fog_state,
             action_buffer=action_buffer,
-            enemy_visible=jnp.ones(self.num_enemies, dtype=jnp.bool_),
+            enemy_visible=visible,
             timestep=0
         )
         
@@ -418,11 +439,14 @@ class JaxSC2Env:
         def apply_inertia(accel, vel):
             v_norm = jnp.linalg.norm(vel, axis=-1, keepdims=True)   # (N, 1)
             has_vel = v_norm > 1e-3
-            vel_dir = vel / jnp.maximum(1e-6, v_norm)               # (N, 2)
             a_mag   = jnp.linalg.norm(accel, axis=-1, keepdims=True) # (N, 1)
             turn_rate = self.combat_cfg.get("turn_rate", 0.4)
-            blended = (1.0 - turn_rate) * (vel_dir * a_mag) + turn_rate * accel
-            return jnp.where(has_vel, blended, accel)
+            heading = jnp.arctan2(vel[:, 1], vel[:, 0])
+            desired = jnp.arctan2(accel[:, 1], accel[:, 0])
+            delta = jnp.arctan2(jnp.sin(desired - heading), jnp.cos(desired - heading))
+            heading = heading + jnp.clip(delta, -turn_rate, turn_rate)
+            rotated = jnp.stack([jnp.cos(heading), jnp.sin(heading)], axis=-1) * a_mag
+            return jnp.where(has_vel, rotated, accel)
 
         accel_vecs = apply_inertia(accel_vecs, state.unit_velocities)  # (N_total, 2)
         
@@ -435,28 +459,30 @@ class JaxSC2Env:
         )
         
         # 5. Dual-Layer Collisions
-        next_pos = apply_mass_collisions(
-            next_pos,
-            state.smax_state.unit_alive,
-            state.smax_state.unit_types,
-            self.type_radius,
-            self.type_mass
-        )
-        next_pos = apply_hard_collisions(
-            next_pos,
-            state.smax_state.unit_alive,
-            unit_radius=0.3,
-            stiffness=1.2
-        )
-        
-        # Terrain Constraints (ally units only)
+        if self.enable_collision:
+            next_pos = apply_mass_collisions(
+                next_pos, state.smax_state.unit_alive, state.smax_state.unit_types,
+                self.type_radius, self.type_mass,
+            )
+            next_pos = apply_hard_collisions(
+                next_pos, state.smax_state.unit_alive, unit_radius=0.3, stiffness=1.2,
+            )
+
+        # Radius-aware terrain constraints apply identically to both teams.
+        terrain_input = next_pos
         next_pos = self.map_instance.enforce_constraints(
             next_pos, 
             state.smax_state.unit_positions,
             self.map_width, 
             self.map_height,
-            self.unit_teams
+            self.unit_teams,
+            unit_radius=self.type_radius[state.smax_state.unit_types],
         )
+        # Collisions/terrain can reject movement; do not retain velocity through
+        # an outer boundary or the cliff. Dead units must not drift either.
+        corrected = jnp.abs(next_pos - terrain_input) > 1e-6
+        next_vel = jnp.where(corrected, 0., next_vel)
+        next_vel = jnp.where(state.smax_state.unit_alive[:, None], next_vel, 0.)
         
         # 6. Target Persistence
         current_targets = update_persistent_targets(
@@ -468,13 +494,25 @@ class JaxSC2Env:
             self.unit_teams,
             self.unit_teams,
             self.unit_type_range[state.smax_state.unit_types],
-            leash_extra=2.5
+            leash_extra=2.5,
+            pool_visible=jnp.where(
+                self.unit_teams[:, None] == 0,
+                jnp.concatenate([jnp.ones(self.num_allies, dtype=jnp.bool_),
+                                 state.enemy_visible])[None, :], True,
+            ),
         )
         
         # Per-unit target override from action
+        target = jnp.clip(exec_action.target, 0, self.num_enemies - 1)
+        manual_valid = (
+            (exec_action.verb == 2) & exec_action.who_mask
+            & (exec_action.target >= 0) & (exec_action.target < self.num_enemies)
+            & state.smax_state.unit_alive[self.num_allies:][target]
+            & state.enemy_visible[target]
+        )
         manual_targets = jnp.where(
-            (action.verb == 2) & action.who_mask, 
-            action.target, 
+            manual_valid,
+            target + self.num_allies,
             -1
         )
         next_targets = current_targets.at[:self.num_allies].set(
@@ -482,8 +520,10 @@ class JaxSC2Env:
         )
         
         # 7. High-Fidelity Combat
-        unit_armor_per_unit = self.unit_armor[state.smax_state.unit_types]  # (N_total,)
-        proj_st = (state.proj_pos, state.proj_vel, state.proj_target, state.proj_damage, state.proj_active, state.proj_team)
+        unit_armor_per_unit = (self.unit_armor[state.smax_state.unit_types]
+                              if self.enable_armor else jnp.zeros(self.num_units))
+        proj_st = (state.proj_pos, state.proj_vel, state.proj_target, state.proj_damage,
+                   state.proj_active, state.proj_team, state.proj_types)
         next_hp, next_alive, next_timers, next_proj_st, dropped_shots = apply_high_fidelity_combat(
             state.smax_state.unit_health,
             state.smax_state.unit_alive,
@@ -515,12 +555,13 @@ class JaxSC2Env:
             state.timestep + 1,
         )
         
-        dists_to_enemies = jnp.linalg.norm(
-            ally_pos[:, None, :] - enemy_pos[None, :, :],
-            axis=-1
-        )
-        visibility = dists_to_enemies < self.vision_radius
-        new_visibility = jnp.any(visibility, axis=0) & enemy_alive
+        if not self.enable_fow:
+            fog_visibility = jnp.ones(self.num_enemies, dtype=jnp.bool_)
+            next_fog_state = FogState(
+                enemy_pos, enemy_alive, next_hp[self.num_allies:],
+                jnp.full(self.num_enemies, state.timestep + 1, dtype=jnp.int32),
+            )
+        new_visibility = fog_visibility & enemy_alive
         
         # 10. Compute Rewards
         dims = jnp.array([self.map_width, self.map_height])
@@ -560,7 +601,7 @@ class JaxSC2Env:
         beacon_reached = jnp.any((dist_to_beacon < 0.05) & ally_alive_obs)
         enemies_dead = jnp.sum(enemy_alive_obs) == 0
         allies_dead = jnp.sum(ally_alive_obs) == 0
-        done = beacon_reached | enemies_dead | allies_dead | (state.timestep >= self.max_steps)
+        done = beacon_reached | enemies_dead | allies_dead | (state.timestep + 1 >= self.max_steps)
         
         # Terminal Rewards (Panda et al., ICML 2026)
         terminal_reward = jnp.where(beacon_reached, 25.0,
@@ -574,6 +615,7 @@ class JaxSC2Env:
             "beacon_reached": beacon_reached,
             "nav_success": beacon_reached,
             "combat_success": enemies_dead,
+            "win": beacon_reached | enemies_dead,
             "enemies_killed": enemy_killed,
             "nav_reward": nav_reward,
             "combat_shaping": combat_shaping,
@@ -593,7 +635,7 @@ class JaxSC2Env:
                 prev_movement_actions=jnp.zeros_like(state.smax_state.prev_movement_actions),
                 prev_attack_actions=jnp.zeros_like(state.smax_state.prev_attack_actions),
                 time=state.timestep + 1,
-                terminal=False,
+                terminal=done,
             ),
             beacon_pos=state.beacon_pos,
             prev_mean_dist=mean_dist,
@@ -609,6 +651,7 @@ class JaxSC2Env:
             proj_damage=next_proj_st[3],
             proj_active=next_proj_st[4],
             proj_team=next_proj_st[5],
+            proj_types=next_proj_st[6],
             fog_state=next_fog_state,
             action_buffer=new_buffer,
             enemy_visible=new_visibility,
@@ -618,13 +661,27 @@ class JaxSC2Env:
         return self.get_obs(next_state), next_state, total_reward, done, info
 
     def get_enemy_actions(self, state: JaxSC2State, rng=None) -> jnp.ndarray:
-        """Enemy AI: simple directional behaviors. Depends on state so outer vmap batches correctly."""
+        """Encode movement toward allies (or a patrol direction) in four directions."""
         enemy_alive = state.smax_state.unit_alive[self.num_allies:]  # (N_enemies,)
-        # mode_id: 0=static(4), 1=guard(6/left), 2=patrol(6), 3=aggressive(6)
+        ally_pos = state.smax_state.unit_positions[:self.num_allies]
+        ally_alive = state.smax_state.unit_alive[:self.num_allies]
+        centroid = self._compute_centroid(ally_pos, ally_alive)
+        delta = centroid - state.smax_state.unit_positions[self.num_allies:]
+        goals = jnp.broadcast_to(centroid, (self.num_enemies, 2))
+        waypoint = self.map_instance.route_waypoints(
+            state.smax_state.unit_positions[self.num_allies:], goals,
+            self.map_width, self.map_height, self.unit_radius,
+        )
+        delta_move = waypoint - state.smax_state.unit_positions[self.num_allies:]
+        horizontal = jnp.abs(delta_move[:, 0]) > jnp.abs(delta_move[:, 1])
+        direction = jnp.where(horizontal, jnp.where(delta_move[:, 0] > 0, 1, 3),
+                              jnp.where(delta_move[:, 1] > 0, 0, 2))
+        nearby = jnp.linalg.norm(delta, axis=-1) < self.combat_cfg["aggression_radius"]
+        patrol = jnp.full(self.num_enemies, (state.timestep // 30) % 4, dtype=jnp.int32)
         base_action = jnp.where(
-            self.mode_id == 0,
-            jnp.ones(self.num_enemies, dtype=jnp.int32) * 4,   # static: stay
-            jnp.ones(self.num_enemies, dtype=jnp.int32) * 6    # all others: move left
+            self.mode_id == 3, direction,
+            jnp.where(self.mode_id == 2, patrol,
+                      jnp.where((self.mode_id == 1) & nearby, direction, 4)),
         )
         # Dead enemies stay
         return jnp.where(enemy_alive, base_action, jnp.ones_like(base_action) * 4)
@@ -676,6 +733,7 @@ class JaxSC2Env:
         
         e_windups = self.combat_cfg["type_windups"][state.smax_state.unit_types[self.num_allies:]]
         e_cd = state.attack_timers[self.num_allies:].astype(jnp.float32) / jnp.maximum(1.0, e_windups)
+        e_cd = jnp.where(state.enemy_visible, e_cd, 0.)
 
         e_feats = jnp.concatenate([e_rel_pos, e_hp_norm[:, None], e_cd[:, None]], axis=-1)
         e_feats = e_feats * e_alive_obs[:, None]
@@ -708,7 +766,7 @@ class JaxSC2Env:
         who_mask = ally_alive.astype(jnp.float32)
 
         # VERB mask: [noop, move, attack]
-        can_attack = jnp.float32(jnp.any(enemy_alive))
+        can_attack = jnp.float32(jnp.any(enemy_alive & state.enemy_visible) & jnp.any(ally_alive))
         move_valid = jnp.float32(jnp.any(ally_alive))
         verb_mask = jnp.array([
             1.0,                # noop always valid
@@ -734,85 +792,153 @@ class JaxSC2Env:
         }
 
     def build_spatial_features(self, state: JaxSC2State) -> Dict[str, jnp.ndarray]:
-        """
-        Mimics Experiment 3's 17-channel feature_screen and 7-channel feature_minimap.
-        """
         if not self.use_spatial_obs:
             return {}
-            
+
         res = self.resolution
         smax_state = state.smax_state
-        
+
+        TYPE_MAP = jnp.array([1.0, 2.0, 3.0])
+        ally_types = TYPE_MAP[smax_state.unit_types[:self.num_allies]]
+        enemy_types = TYPE_MAP[smax_state.unit_types[self.num_allies:]]
+
         def get_grid_obs(positions, healths, alives, visibility, map_bounds, grid_res):
             clamped_pos = jnp.where(alives[:, None] & visibility[:, None], positions, -100.0)
-            
             grid_pos = ((clamped_pos - map_bounds[:2]) / (map_bounds[2:] - map_bounds[:2]) * grid_res).astype(jnp.int32)
             in_view = (grid_pos >= 0).all(axis=-1) & (grid_pos < grid_res).all(axis=-1) & alives & visibility
-            
             indices = grid_pos[:, 1] * grid_res + grid_pos[:, 0]
             chan_pos_flat = jnp.zeros(grid_res * grid_res)
             chan_hp_flat = jnp.zeros(grid_res * grid_res)
-            
             chan_pos_flat = chan_pos_flat.at[indices].add(in_view.astype(jnp.float32))
             chan_hp_flat = chan_hp_flat.at[indices].add(healths * in_view)
-            
             return chan_pos_flat.reshape(grid_res, grid_res), chan_hp_flat.reshape(grid_res, grid_res)
 
         def get_terrain_mask(map_bounds, grid_res):
-            x_grid, y_grid = jnp.meshgrid(jnp.linspace(map_bounds[0]/self.map_width, map_bounds[2]/self.map_width, grid_res),
-                                          jnp.linspace(map_bounds[1]/self.map_height, map_bounds[3]/self.map_height, grid_res),
+            x_grid, y_grid = jnp.meshgrid(jnp.linspace(map_bounds[0], map_bounds[2], grid_res),
+                                          jnp.linspace(map_bounds[1], map_bounds[3], grid_res),
                                           indexing='xy')
-            in_cliff_x = (x_grid > 0.45) & (x_grid < 0.55)
-            on_bridge_1 = (y_grid > 0.2) & (y_grid < 0.3)
-            on_bridge_2 = (y_grid > 0.7) & (y_grid < 0.8)
-            return (in_cliff_x & ~(on_bridge_1 | on_bridge_2)).astype(jnp.float32)
+            return self.map_instance.terrain_mask(
+                jnp.stack([x_grid, y_grid], axis=-1), self.map_width, self.map_height,
+            ).astype(jnp.float32)
 
-        # 1. Global Minimap (7 Channels)
+        def get_player_relative_grid(positions, alives, visibility_for_ally, map_bounds, grid_res, team_id=0):
+            """Returns (res, res, 5) for categories bg=0, self=1, ally=2, neutral=3, enemy=4."""
+            n = len(positions)
+            grid = jnp.zeros((5, grid_res * grid_res))
+
+            clamped_pos = jnp.where(alives[:, None] & visibility_for_ally[:, None], positions, -100.0)
+            grid_pos = ((clamped_pos - map_bounds[:2]) / (map_bounds[2:] - map_bounds[:2]) * grid_res).astype(jnp.int32)
+            in_view = (grid_pos >= 0).all(axis=-1) & (grid_pos < grid_res).all(axis=-1) & alives & visibility_for_ally
+            indices = grid_pos[:, 1] * grid_res + grid_pos[:, 0]
+
+            teams = smax_state.unit_teams
+            cat = jnp.where(teams == team_id, 1, 4)
+            for c in range(5):
+                flat = jnp.zeros(grid_res * grid_res)
+                flat = flat.at[indices].add(((cat == c) & in_view).astype(jnp.float32))
+                grid = grid.at[c].set(flat)
+            grid = grid.at[0].set((jnp.sum(grid[1:], axis=0) == 0).astype(jnp.float32))
+            return jnp.moveaxis(grid.reshape(5, grid_res, grid_res), 0, -1)
+
+        def get_visibility_grid(positions, alives, visibility_for_ally, map_bounds, grid_res):
+            grid = jnp.zeros(grid_res * grid_res)
+            clamped_pos = jnp.where(alives[:, None] & visibility_for_ally[:, None], positions, -100.0)
+            grid_pos = ((clamped_pos - map_bounds[:2]) / (map_bounds[2:] - map_bounds[:2]) * grid_res).astype(jnp.int32)
+            in_visible = (grid_pos >= 0).all(axis=-1) & (grid_pos < grid_res).all(axis=-1) & alives & visibility_for_ally
+            indices = grid_pos[:, 1] * grid_res + grid_pos[:, 0]
+            flat = jnp.zeros(grid_res * grid_res)
+            flat = flat.at[indices].add(in_visible.astype(jnp.float32))
+            return flat.reshape(grid_res, grid_res)
+
         m_bounds = jnp.array([0, 0, self.map_width, self.map_height])
-        m_ally_p, m_ally_h = get_grid_obs(smax_state.unit_positions[:self.num_allies], 
-                                          smax_state.unit_health[:self.num_allies]/45.0, 
-                                          smax_state.unit_alive[:self.num_allies], 
+        m_ally_p, m_ally_h = get_grid_obs(smax_state.unit_positions[:self.num_allies],
+                                          smax_state.unit_health[:self.num_allies]/45.0,
+                                          smax_state.unit_alive[:self.num_allies],
                                           jnp.ones(self.num_allies, dtype=jnp.bool_),
                                           m_bounds, res)
-        m_enemy_p, m_enemy_h = get_grid_obs(smax_state.unit_positions[self.num_allies:], 
-                                            smax_state.unit_health[self.num_allies:]/45.0, 
-                                            smax_state.unit_alive[self.num_allies:], 
+        m_enemy_p, m_enemy_h = get_grid_obs(smax_state.unit_positions[self.num_allies:],
+                                            smax_state.unit_health[self.num_allies:]/45.0,
+                                            smax_state.unit_alive[self.num_allies:],
                                             state.enemy_visible,
                                             m_bounds, res)
-        m_beacon_p, _ = get_grid_obs(state.beacon_pos[None, :], jnp.array([1.0]), jnp.array([True]), 
+        m_beacon_p, _ = get_grid_obs(state.beacon_pos[None, :], jnp.array([1.0]), jnp.array([True]),
                                      jnp.array([True]), m_bounds, res)
-        
         m_terrain = get_terrain_mask(m_bounds, res)
-        minimap = jnp.stack([m_terrain, m_ally_p, m_ally_h, m_enemy_p, m_enemy_h, m_beacon_p, jnp.zeros((res, res))])
 
-        # 2. Camera-Locked Screen (17 Channels)
+        m_vis = get_visibility_grid(smax_state.unit_positions[:self.num_allies],
+                                    smax_state.unit_alive[:self.num_allies],
+                                    jnp.ones(self.num_allies, dtype=jnp.bool_),
+                                    m_bounds, res)
+        m_player_rel = get_player_relative_grid(smax_state.unit_positions,
+                                                 jnp.concatenate([smax_state.unit_alive[:self.num_allies],
+                                                                  smax_state.unit_alive[self.num_allies:]]),
+                                                 jnp.concatenate([jnp.ones(self.num_allies, dtype=jnp.bool_),
+                                                                  state.enemy_visible]),
+                                                 m_bounds, res, team_id=0)
+
         centroid = self._compute_centroid(smax_state.unit_positions[:self.num_allies], smax_state.unit_alive[:self.num_allies])
-        view_size = 8.0 
-        s_bounds = jnp.array([centroid[0]-view_size, centroid[1]-view_size, 
+        cam_y = ((centroid[1] / self.map_height) * res).astype(jnp.int32)
+        cam_x = ((centroid[0] / self.map_width) * res).astype(jnp.int32)
+        half_cam = 2
+        y_lo, y_hi = jnp.clip(cam_y-half_cam, 0, res-1), jnp.clip(cam_y+half_cam+1, 0, res)
+        x_lo, x_hi = jnp.clip(cam_x-half_cam, 0, res-1), jnp.clip(cam_x+half_cam+1, 0, res)
+        grid_y, grid_x = jnp.meshgrid(jnp.arange(res), jnp.arange(res), indexing="ij")
+        m_camera = ((grid_y >= y_lo) & (grid_y < y_hi)
+                    & (grid_x >= x_lo) & (grid_x < x_hi)).astype(jnp.float32)
+
+        minimap = jnp.stack([
+            m_terrain,
+            m_vis,
+            m_player_rel[..., 0],
+            m_player_rel[..., 4],
+            m_ally_p,
+            m_enemy_p,
+            m_camera,
+        ], axis=0)
+
+
+        view_size = 8.0
+        s_bounds = jnp.array([centroid[0]-view_size, centroid[1]-view_size,
                               centroid[0]+view_size, centroid[1]+view_size])
-        
-        s_ally_p, s_ally_h = get_grid_obs(smax_state.unit_positions[:self.num_allies], 
-                                          smax_state.unit_health[:self.num_allies]/45.0, 
-                                          smax_state.unit_alive[:self.num_allies], 
+
+        s_ally_p, s_ally_h = get_grid_obs(smax_state.unit_positions[:self.num_allies],
+                                          smax_state.unit_health[:self.num_allies]/45.0,
+                                          smax_state.unit_alive[:self.num_allies],
                                           jnp.ones(self.num_allies, dtype=jnp.bool_),
                                           s_bounds, res)
-        s_enemy_p, s_enemy_h = get_grid_obs(smax_state.unit_positions[self.num_allies:], 
-                                            smax_state.unit_health[self.num_allies:]/45.0, 
-                                            smax_state.unit_alive[self.num_allies:], 
+        s_enemy_p, s_enemy_h = get_grid_obs(smax_state.unit_positions[self.num_allies:],
+                                            smax_state.unit_health[self.num_allies:]/45.0,
+                                            smax_state.unit_alive[self.num_allies:],
                                             state.enemy_visible,
                                             s_bounds, res)
-        s_beacon_p, _ = get_grid_obs(state.beacon_pos[None, :], jnp.array([1.0]), jnp.array([True]), 
+        s_beacon_p, _ = get_grid_obs(state.beacon_pos[None, :], jnp.array([1.0]), jnp.array([True]),
                                      jnp.array([True]), s_bounds, res)
-        
         s_terrain = get_terrain_mask(s_bounds, res)
-        
+
+        s_vis = get_visibility_grid(smax_state.unit_positions[:self.num_allies],
+                                    smax_state.unit_alive[:self.num_allies],
+                                    jnp.ones(self.num_allies, dtype=jnp.bool_),
+                                    s_bounds, res)
+
+        s_player_rel = get_player_relative_grid(
+            jnp.concatenate([smax_state.unit_positions[:self.num_allies],
+                             smax_state.unit_positions[self.num_allies:]]),
+            jnp.concatenate([smax_state.unit_alive[:self.num_allies],
+                             smax_state.unit_alive[self.num_allies:]]),
+            jnp.concatenate([jnp.ones(self.num_allies, dtype=jnp.bool_),
+                             state.enemy_visible]),
+            s_bounds, res, team_id=0)
+
         screen = jnp.zeros((17, res, res))
         screen = screen.at[0].set(s_terrain)
-        screen = screen.at[5].set(s_ally_p)
-        screen = screen.at[6].set(s_enemy_p)
-        screen = screen.at[7].set(s_beacon_p)
-        screen = screen.at[8].set(s_ally_h)
-        screen = screen.at[9].set(s_enemy_h)
+        screen = screen.at[1].set(s_vis)
+        for c in range(5):
+            screen = screen.at[2+c].set(s_player_rel[..., c])
+        screen = screen.at[7].set(s_ally_p)
+        screen = screen.at[8].set(s_enemy_p)
+        screen = screen.at[9].set(s_beacon_p)
+        screen = screen.at[10].set(s_ally_h)
+        screen = screen.at[11].set(s_enemy_h)
 
         return {"screen": screen, "minimap": minimap}
 
@@ -827,13 +953,19 @@ class JaxSC2GymEnv(gym.Env):
         self.num_allies = self.env.num_allies
         self.num_enemies = self.env.num_enemies
         
-        self.observation_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(63,), dtype=jnp.float32)
-        self.action_space = gym.spaces.MultiDiscrete([2, 3, 8, 8])
+        max_cooldown = float(jnp.max(
+            (self.env.combat_cfg["type_windups"] + self.env.combat_cfg["type_cooldowns"] - 1)
+            / self.env.combat_cfg["type_windups"]))
+        low = np.array([-1., -1., 0., 0.] * 13 + [0.] * 8 + [-1., -1., 0.], dtype=np.float32)
+        high = np.array([1.] * 20 + [1., 1., 1., max_cooldown] * 8 + [1.] * 11, dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        self.action_space = gym.spaces.MultiDiscrete([1 << self.num_allies, 3, 8, self.num_enemies])
         
         self._state = None
         self._rng = jax.random.PRNGKey(0)
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
+        super().reset(seed=seed)
         if seed is not None:
             self._rng = jax.random.PRNGKey(seed)
         
@@ -841,11 +973,11 @@ class JaxSC2GymEnv(gym.Env):
         obs, self._state = self.env.reset(reset_rng)
         
         mask = self.env.get_action_mask(self._state)
-        info = {"action_mask": mask}
+        info = {"action_mask": jax.tree_util.tree_map(np.asarray, mask)}
         
         if isinstance(obs, dict):
-            return obs["vector"], info
-        return obs, info
+            obs = obs["vector"]
+        return np.asarray(obs, dtype=np.float32), info
 
     def step(self, action):
         who_val, verb, direction, target = action
@@ -867,11 +999,15 @@ class JaxSC2GymEnv(gym.Env):
         
         mask = self.env.get_action_mask(self._state)
         info["action_mask"] = mask
+        info = jax.tree_util.tree_map(np.asarray, info)
         
         if isinstance(obs, dict):
             obs = obs["vector"]
             
-        return obs, float(reward), bool(done), False, info
+        time_limit = bool(self._state.timestep >= self.env.max_steps)
+        terminated = bool(info["nav_success"] | info["combat_success"]
+                          | ~jnp.any(self._state.smax_state.unit_alive[:self.num_allies]))
+        return np.asarray(obs, dtype=np.float32), float(reward), terminated, bool(done) and time_limit and not terminated, info
 
     def render(self):
         pass

@@ -83,7 +83,34 @@ model = MaskPPO(config=config)
 model.train(env, total_steps=30_000_000)
 ```
 
+Training output reports mean **episode reward**: the sum of raw environment
+rewards through termination, averaged over episodes completed since the previous
+log. Partial episodes carry across rollouts; output is `n/a` until one completes.
+TensorBoard uses `train/episode_reward`, `train/episode_length`, and
+`train/completed_episodes`. The separate `train/step_reward` metric is the latest
+rollout's per-step mean, not an episode return. This applies to PPO, MaskPPO, and A2C.
+
+To resume a launcher run, use the same arguments and run directory with
+`--resume /path/to/checkpoint.pkl`. `--total-steps` remains the overall target,
+not additional steps. Parameters, optimizer state, reward normalization, and
+global step are restored; environments and partial episode counters restart.
+
 ## 🎬 Visualizations
+
+### Scripted Beacon and Combat Baselines
+
+Run deterministic per-unit agents across all nine scenarios and the collision,
+armor, fog, and latency settings, with a GIF gallery and JSON metrics:
+
+```bash
+conda run --no-capture-output -n twobridge env PYTHONPATH=. \
+  python -m JaxSC2.scripted.evaluate --render all
+```
+
+Open `runs/scripted_evaluation/index.html` to compare the behavior. The beacon
+agent routes through bridges; the combat agent approaches known enemies and
+attacks within each unit's weapon range. See the [scripted agent guide](JaxSC2/scripted/README.md)
+for opponent modes, seeds, and focused evaluations.
 
 Generate demo GIFs:
 ```bash

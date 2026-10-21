@@ -46,6 +46,7 @@ def test_fog_memory():
     fog = FogState(
         last_seen_pos=jnp.array([[0.0, 0.0]]),
         last_seen_alive=jnp.array([True]),
+        last_seen_hp=jnp.array([45.0]),
         last_seen_time=jnp.array([0])
     )
     
@@ -53,7 +54,7 @@ def test_fog_memory():
     enemy_pos = jnp.array([[20.0, 0.0]]) # OOB
     vision_radius = 10.0
     
-    new_fog, visible = update_fog_memory(fog, ally_pos, jnp.array([True]), enemy_pos, jnp.array([True]), vision_radius, 1)
+    new_fog, visible = update_fog_memory(fog, ally_pos, jnp.array([True]), enemy_pos, jnp.array([True]), jnp.array([45.0]), vision_radius, 1)
     
     assert visible[0] == False
     # Memory should persist (0,0) from initialization since it wasn't seen at (20,0)
@@ -61,7 +62,7 @@ def test_fog_memory():
     
     # Move enemy into vision
     enemy_pos_v = jnp.array([[5.0, 0.0]])
-    new_fog_v, visible_v = update_fog_memory(new_fog, ally_pos, jnp.array([True]), enemy_pos_v, jnp.array([True]), vision_radius, 2)
+    new_fog_v, visible_v = update_fog_memory(new_fog, ally_pos, jnp.array([True]), enemy_pos_v, jnp.array([True]), jnp.array([45.0]), vision_radius, 2)
     
     assert visible_v[0] == True
     assert jnp.array_equal(new_fog_v.last_seen_pos[0], jnp.array([5.0, 0.0]))
@@ -94,7 +95,7 @@ def test_armor_and_bonus():
     
     # Melee (index 0) fires at index 1 (Tank).
     # Base dmg 10. Tank armor 5. Net dmg = 5.
-    hp1, _, _, _ = apply_high_fidelity_combat(
+    hp1, _, _, _, _ = apply_high_fidelity_combat(
         unit_health, unit_alive, unit_positions, unit_types, unit_teams, 
         unit_armor, attack_timers, targets, proj_state, combat_cfg
     )
@@ -104,7 +105,7 @@ def test_armor_and_bonus():
     
     # Test bonus damage
     combat_cfg["bonus_matrix"] = combat_cfg["bonus_matrix"].at[0, 2].set(10.0) # Melee bonus vs Tank
-    hp2, _, _, _ = apply_high_fidelity_combat(
+    hp2, _, _, _, _ = apply_high_fidelity_combat(
         unit_health, unit_alive, unit_positions, unit_types, unit_teams, 
         unit_armor, attack_timers, targets, proj_state, combat_cfg
     )

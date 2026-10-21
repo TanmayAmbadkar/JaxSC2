@@ -76,34 +76,116 @@ class TwoBridgeMap:
             
         return jax.lax.switch(layout_type, [select_base, select_combat, select_navigate])
 
-    def enforce_constraints(self, next_pos, prev_pos, map_w, map_h, unit_teams):
-        """Bridge-and-Cliff terrain logic. Only constrains ally units (team=0)."""
-        # Normalized x=0.5 is the cliff
-        px = prev_pos[..., 0] / map_w
-        py = prev_pos[..., 1] / map_h
-        nx = next_pos[..., 0] / map_w
-        ny = next_pos[..., 1] / map_h
-        
-        # Crossing the central cliff (x=0.5)
-        cross_cliff = ((px < 0.5) & (nx >= 0.5)) | ((px >= 0.5) & (nx < 0.5))
-        
-        # Bridges (y ranges)
-        on_bridge_1 = (ny > 0.2) & (ny < 0.3)
-        on_bridge_2 = (ny > 0.7) & (ny < 0.8)
-        blocked = cross_cliff & ~(on_bridge_1 | on_bridge_2)
-        
-        # Only constrain ally units (team=0), enemies move freely
-        is_ally = unit_teams == 0
-        
-        # Apply constraint only to ally units that are blocked
-        constrained = blocked & is_ally
-        
-        # Reset X to previous valid side if constrained (keep shape (N,))
-        safe_nx = jnp.where(constrained, px, nx)
-        
-        # Reconstruct position: keep Y unchanged, use safe X
-        safe_nx_scaled = safe_nx * map_w
-        return next_pos.at[..., 0].set(safe_nx_scaled)
+    # Normalized geometry shared by collision checks, feature maps and rendering.
+    DITCH_X = (.45, .55)
+    BRIDGE_Y = ((.2, .3), (.7, .8))
+
+    def obstacle_rectangles(self, map_w, map_h, unit_radius=0.):
+        """Three ditch rectangles, conservatively expanded for a unit's radius."""
+        x0, x1 = self.DITCH_X
+        (b0, b1), (b2, b3) = self.BRIDGE_Y
+        rectangles = jnp.array([
+            [x0 * map_w, 0., x1 * map_w, b0 * map_h],
+            [x0 * map_w, b1 * map_h, x1 * map_w, b2 * map_h],
+            [x0 * map_w, b3 * map_h, x1 * map_w, map_h],
+        ])
+        return rectangles + jnp.asarray(unit_radius)[..., None, None] * jnp.array([-1., -1., 1., 1.])
+
+    def terrain_mask(self, positions, map_w, map_h):
+        """True where a point lies in the visible ditch footprint."""
+        rectangles = self.obstacle_rectangles(map_w, map_h)
+        inside = ((positions[..., None, :] > rectangles[:, :2])
+                  & (positions[..., None, :] < rectangles[:, 2:])).all(axis=-1)
+        return jnp.any(inside, axis=-1)
+
+    def is_walkable(self, positions, map_w, map_h, unit_radius=.6, tolerance=1e-5):
+        """Check world bounds and radius clearance for arbitrary leading axes."""
+        radius = jnp.asarray(unit_radius)
+        rectangles = self.obstacle_rectangles(map_w, map_h, radius)
+        inside = ((positions[..., None, :] > rectangles[..., :2] + tolerance)
+                  & (positions[..., None, :] < rectangles[..., 2:] - tolerance)).all(axis=-1)
+        bounded = ((positions >= radius[..., None] - tolerance)
+                   & (positions <= jnp.array([map_w, map_h]) - radius[..., None] + tolerance)).all(axis=-1)
+        return bounded & ~jnp.any(inside, axis=-1)
+
+    def route_waypoints(self, positions, goals, map_w, map_h, unit_radius=.6):
+        """Stay in a bridge corridor until the entire unit reaches the far bank."""
+        middle = map_w * .5
+        bank_left = self.DITCH_X[0] * map_w - unit_radius - .5
+        bank_right = self.DITCH_X[1] * map_w + unit_radius + .5
+        on_bridge = (positions[:, 0] > bank_left) & (positions[:, 0] < bank_right)
+        left = positions[:, 0] < middle
+        goal_left = goals[:, 0] < middle
+        crossing = (left != goal_left) | on_bridge
+        bridges = jnp.array([(a + b) / 2 for a, b in self.BRIDGE_Y]) * map_h
+        entry_cost = jnp.abs(positions[:, 1, None] - bridges)
+        cost = entry_cost + jnp.abs(goals[:, 1, None] - bridges) + .05 * entry_cost
+        bridge_index = jnp.argmin(jnp.where(on_bridge[:, None], entry_cost, cost), axis=-1)
+        bridge_y = bridges[bridge_index]
+        aligned = jnp.abs(positions[:, 1] - bridge_y) < .4
+        near_x = jnp.where(left, bank_left, bank_right)
+        far_x = jnp.where(goal_left, bank_left, bank_right)
+        waypoint = jnp.stack([jnp.where(aligned | on_bridge, far_x, near_x), bridge_y], axis=-1)
+        return jnp.where(crossing[:, None], waypoint, goals)
+
+    def enforce_constraints(self, next_pos, prev_pos, map_w, map_h, unit_teams, unit_radius=.6):
+        """Sweep unit centers against radius-expanded ditch rectangles, for both teams.
+
+        Resolve the first contact, remove its inward displacement, then slide
+        along the edge. Three contacts suffice for this axis-aligned geometry.
+        Radius expansion is conservative at corners and also prevents tunneling.
+        """
+        radius = jnp.broadcast_to(jnp.asarray(unit_radius), prev_pos.shape[:-1])
+        limits = jnp.array([map_w, map_h])
+        rectangles = self.obstacle_rectangles(map_w, map_h, radius)
+        start = jnp.clip(prev_pos, radius[:, None], limits - radius[:, None])
+
+        # Recover an invalid input position (e.g. an older saved simulation).
+        def repair(i, position):
+            box = rectangles[:, i]
+            inside = ((position > box[:, :2]) & (position < box[:, 2:])).all(axis=-1)
+            x, y = position[:, 0], position[:, 1]
+            candidates = jnp.stack([
+                jnp.stack([box[:, 0], y], -1), jnp.stack([box[:, 2], y], -1),
+                jnp.stack([x, box[:, 1]], -1), jnp.stack([x, box[:, 3]], -1),
+            ], axis=1)
+            valid = ((candidates >= radius[:, None, None])
+                     & (candidates <= limits - radius[:, None, None])).all(axis=-1)
+            distance = jnp.sum((candidates - position[:, None, :]) ** 2, axis=-1)
+            closest = jnp.argmin(jnp.where(valid, distance, jnp.inf), axis=-1)
+            recovered = candidates[jnp.arange(len(position)), closest]
+            return jnp.where(inside[:, None], recovered, position)
+
+        start = jax.lax.fori_loop(0, 3, repair, start)
+        desired = jnp.clip(next_pos, radius[:, None], limits - radius[:, None])
+
+        def slide(_, carry):
+            position, remaining = carry
+            parallel = jnp.abs(remaining[:, None, :]) < 1e-8
+            delta = jnp.where(parallel, 1., remaining[:, None, :])
+            near = (rectangles[..., :2] - position[:, None, :]) / delta
+            far = (rectangles[..., 2:] - position[:, None, :]) / delta
+            entry_axis, exit_axis = jnp.minimum(near, far), jnp.maximum(near, far)
+            parallel_inside = ((position[:, None, :] > rectangles[..., :2])
+                               & (position[:, None, :] < rectangles[..., 2:]))
+            entry_axis = jnp.where(parallel, jnp.where(parallel_inside, -jnp.inf, jnp.inf), entry_axis)
+            exit_axis = jnp.where(parallel, jnp.where(parallel_inside, jnp.inf, -jnp.inf), exit_axis)
+            entry, exit = jnp.max(entry_axis, axis=-1), jnp.min(exit_axis, axis=-1)
+            hits = (entry >= -1e-6) & (entry < 1.) & (exit > jnp.maximum(entry, 0.))
+            times = jnp.where(hits, jnp.maximum(entry, 0.), jnp.inf)
+            obstacle = jnp.argmin(times, axis=-1)
+            first = times[jnp.arange(len(position)), obstacle]
+            contact = jnp.isfinite(first)
+            fraction = jnp.where(contact, jnp.maximum(first - 1e-5, 0.), 1.)
+            position = position + remaining * fraction[:, None]
+            normal_axis = jnp.argmax(entry_axis[jnp.arange(len(position)), obstacle], axis=-1)
+            remaining = remaining * (1. - fraction[:, None])
+            remaining = jnp.where(
+                contact[:, None] & (jnp.arange(2) == normal_axis[:, None]), 0., remaining)
+            return position, remaining
+
+        position, _ = jax.lax.fori_loop(0, 3, slide, (start, desired - start))
+        return jnp.clip(position, radius[:, None], limits - radius[:, None])
 
     def compute_reward(self, state, next_smax_state, num_allies, num_enemies, map_w, map_h):
         """Unified reward shaping for Two-Bridge."""

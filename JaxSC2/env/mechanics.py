@@ -110,7 +110,7 @@ def integrate_velocity(pos, vel, accel_vec, max_speed, friction=0.9):
     new_vel = (vel + accel_vec) * friction
     
     v_norm = jnp.linalg.norm(new_vel, axis=-1, keepdims=True)
-    new_vel = new_vel * jnp.minimum(1.0, max_speed[..., None] / (v_norm + 1e-6))
+    new_vel = new_vel * jnp.minimum(1.0, jnp.asarray(max_speed)[..., None] / (v_norm + 1e-6))
     
     # 3. Update Position
     new_pos = pos + new_vel
@@ -137,18 +137,21 @@ def update_fog_memory(state: FogState, ally_pos, ally_alive, enemy_pos, enemy_al
     ), visible
 
 def update_projectiles(proj_pos, proj_vel, proj_target, proj_active, proj_team, unit_pos, unit_alive, unit_teams):
-    """Ballistic projectiles: they hit the FIRST enemy they collide with."""
-    new_p_pos = proj_pos + proj_vel 
-    diff = new_p_pos[:, None, :] - unit_pos[None, :, :]
-    dists = jnp.linalg.norm(diff, axis=-1)
-    
+    """Intersect each traveled segment with enemy circles; choose first contact."""
+    new_p_pos = proj_pos + proj_vel
+    offset = proj_pos[:, None, :] - unit_pos[None, :, :]
+    speed_sq = jnp.sum(proj_vel ** 2, axis=-1)[:, None]
+    b = jnp.sum(offset * proj_vel[:, None, :], axis=-1)
+    c = jnp.sum(offset ** 2, axis=-1) - 0.6 ** 2
+    discriminant = b ** 2 - speed_sq * c
+    entry = (-b - jnp.sqrt(jnp.maximum(discriminant, 0.))) / jnp.maximum(speed_sq, 1e-12)
+    entry = jnp.where(c <= 0., 0., entry)
+    intersects = (discriminant >= 0.) & (entry >= 0.) & (entry <= 1.)
+    intersects &= (speed_sq > 1e-12) | (c <= 0.)
     is_enemy = proj_team[:, None] != unit_teams[None, :]
-    potential_hits = proj_active[:, None] & unit_alive[None, :] & is_enemy & (dists < 0.6)
-    
-    # Distance-based selection to remove index bias
-    masked_dists = jnp.where(potential_hits, dists, jnp.inf)
+    potential_hits = proj_active[:, None] & unit_alive[None, :] & is_enemy & intersects
     hit_triggered = jnp.any(potential_hits, axis=1)
-    hit_targets = jnp.argmin(masked_dists, axis=1).astype(jnp.int32)
+    hit_targets = jnp.argmin(jnp.where(potential_hits, entry, jnp.inf), axis=1).astype(jnp.int32)
     
     safe_targets = jnp.where(proj_target >= 0, proj_target, 0).astype(jnp.int32)
     target_pos = unit_pos[safe_targets]
@@ -168,24 +171,38 @@ def apply_high_fidelity_combat(
     bonus_matrix = combat_cfg.get("bonus_matrix", jnp.zeros_like(combat_cfg["damage_matrix"]))
     N_units = unit_health.shape[0]
     
-    target_idx = jnp.where(targets >= 0, targets, 0).astype(jnp.int32)
+    valid_target = (targets >= 0) & (targets < N_units)
+    target_idx = jnp.clip(targets, 0, N_units - 1).astype(jnp.int32)
     t_pos = unit_positions[target_idx]
     dist = jnp.linalg.norm(unit_positions - t_pos, axis=-1)
     in_range = (unit_alive) & (targets >= 0) & (dist < combat_cfg["type_ranges"][unit_types])
     
-    can_attack = unit_alive & (targets >= 0) & in_range
-    new_timers = jnp.where(can_attack, attack_timers + 1, 0).astype(jnp.int32)
-    firing = (new_timers == windups) & can_attack
+    can_attack = (unit_alive & valid_target & in_range & unit_alive[target_idx]
+                  & (unit_teams != unit_teams[target_idx]))
+    # Once a shot fires, cooldown continues even if the target dies or leaves.
+    recovering = attack_timers >= windups
+    new_timers = jnp.where(recovering | can_attack, attack_timers + 1, 0).astype(jnp.int32)
+    firing = (new_timers == windups) & can_attack & ~recovering
     
     melee_fire = firing & (unit_types == 0)
-    ranged_fire = firing & (unit_types == 1)
+    ranged_fire = firing & (unit_types != 0)
     
-    p_pos, p_vel, p_target, p_damage, p_active, p_team = proj_state
+    p_pos, p_vel, p_target, p_damage, p_active, p_team = proj_state[:6]
+    # Older callers may pass six arrays containing already-mitigated damage.
+    p_types = proj_state[6] if len(proj_state) == 7 else jnp.full_like(p_target, -1)
     
     # 1. Update Projectiles
     p_pos, p_active, hit_triggered, hit_targets = update_projectiles(
         p_pos, p_vel, p_target, p_active, p_team, unit_positions, unit_alive, unit_teams
     )
+    # Preserve impact damage before free slots can be reused by new shots.
+    shot_types = jnp.maximum(p_types, 0)
+    hit_types = unit_types[hit_targets]
+    effective_damage = jnp.maximum(
+        0.5, p_damage * combat_cfg["damage_matrix"][shot_types, hit_types]
+        + bonus_matrix[shot_types, hit_types] - unit_armor[hit_targets],
+    )
+    hit_damage = jnp.where(hit_triggered, jnp.where(p_types < 0, p_damage, effective_damage), 0.)
     
     # 2. Spawn logic with Slot Allocation
     vec_all = t_pos - unit_positions
@@ -194,7 +211,7 @@ def apply_high_fidelity_combat(
     slot_mask = ~p_active # (32,)
     
     def spawn_one(state, i):
-        p_pos, p_vel, p_target, p_damage, p_active, p_team, free_slots, d_count = state
+        p_pos, p_vel, p_target, p_damage, p_active, p_team, p_types, free_slots, d_count = state
         should_fire = ranged_fire[i]
         
         # Find first free slot
@@ -208,12 +225,11 @@ def apply_high_fidelity_combat(
         p_active = p_active.at[idx].set(jnp.where(can_fire_idx, True, p_active[idx]))
         p_team = p_team.at[idx].set(jnp.where(can_fire_idx, unit_teams[i], p_team[idx]))
         
-        # Damage logic
-        mult = combat_cfg["damage_matrix"][unit_types[i], unit_types[target_idx[i]]]
-        bonus = bonus_matrix[unit_types[i], unit_types[target_idx[i]]]
-        raw = combat_cfg["type_damages"][unit_types[i]] * mult + bonus
-        dmg_val = jnp.maximum(0.5, raw - unit_armor[target_idx[i]])
-        p_damage = p_damage.at[idx].set(jnp.where(can_fire_idx, dmg_val, p_damage[idx]))
+        # Store the weapon's base damage/type, and mitigate against the unit
+        # actually hit later (which can differ from the intended target).
+        p_damage = p_damage.at[idx].set(jnp.where(
+            can_fire_idx, combat_cfg["type_damages"][unit_types[i]], p_damage[idx]))
+        p_types = p_types.at[idx].set(jnp.where(can_fire_idx, unit_types[i], p_types[idx]))
         
         # Consume slot
         new_free_slots = free_slots.at[idx].set(jnp.where(can_fire_idx, False, free_slots[idx]))
@@ -222,12 +238,12 @@ def apply_high_fidelity_combat(
         dropped = should_fire & (~free_slots[idx])
         new_d_count = d_count + dropped.astype(jnp.int32)
         
-        return (p_pos, p_vel, p_target, p_damage, p_active, p_team, new_free_slots, new_d_count), None
+        return (p_pos, p_vel, p_target, p_damage, p_active, p_team, p_types, new_free_slots, new_d_count), None
 
     # We use scan to allocate slots one by one for firing units
     init_dropped = jnp.int32(0)
-    final_p_st, _ = jax.lax.scan(spawn_one, (p_pos, p_vel, p_target, p_damage, p_active, p_team, slot_mask, init_dropped), jnp.arange(N_units))
-    p_pos, p_vel, p_target, p_damage, p_active, p_team, _, dropped_shots = final_p_st
+    final_p_st, _ = jax.lax.scan(spawn_one, (p_pos, p_vel, p_target, p_damage, p_active, p_team, p_types, slot_mask, init_dropped), jnp.arange(N_units))
+    p_pos, p_vel, p_target, p_damage, p_active, p_team, p_types, _, dropped_shots = final_p_st
 
     new_timers = jnp.where(new_timers >= total_cycle, 0, new_timers)
     
@@ -246,15 +262,15 @@ def apply_high_fidelity_combat(
     
     damage_to_apply = jnp.zeros_like(unit_health)
     damage_to_apply = damage_to_apply.at[target_idx].add(jnp.where(melee_fire, melee_dmg_val, 0.0))
-    damage_to_apply = damage_to_apply.at[hit_targets].add(jnp.where(hit_triggered, p_damage, 0.0))
+    damage_to_apply = damage_to_apply.at[hit_targets].add(hit_damage)
     
     new_health = jnp.clip(unit_health - damage_to_apply, 0.0, 200.0)
     new_alive = new_health > 0
-    final_proj_state = (p_pos, p_vel, p_target, p_damage, p_active, p_team)
+    final_proj_state = (p_pos, p_vel, p_target, p_damage, p_active, p_team, p_types)
     
     return new_health, new_alive, new_timers, final_proj_state, dropped_shots
 
-def update_persistent_targets(current_targets, unit_positions, unit_alive, target_pool_positions, target_pool_alive, unit_teams, pool_teams, unit_ranges, leash_extra: float = 2.0):
+def update_persistent_targets(current_targets, unit_positions, unit_alive, target_pool_positions, target_pool_alive, unit_teams, pool_teams, unit_ranges, leash_extra: float = 2.0, pool_visible=None):
     """
     SC2-style persistent targeting. Units stick to a target unless it dies or leaves leash range.
     """
@@ -271,10 +287,14 @@ def update_persistent_targets(current_targets, unit_positions, unit_alive, targe
     
     # Leash check
     is_valid = (current_targets >= 0) & target_alive & (dist_to_current < (unit_ranges + leash_extra))
+    if pool_visible is not None:
+        is_valid &= pool_visible[jnp.arange(N), safe_targets]
     
     # 2. Pick new closest if invalid
     # Mask out dead units AND teammates
     enemy_mask = (unit_teams[:, None] != pool_teams[None, :])
+    if pool_visible is not None:
+        enemy_mask &= pool_visible
     valid_pool_dists = jnp.where(target_pool_alive[None, :] & enemy_mask, dists, jnp.inf)
     new_closest = jnp.argmin(valid_pool_dists, axis=1)
     

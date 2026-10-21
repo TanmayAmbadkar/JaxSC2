@@ -4,6 +4,17 @@ from algorithms.mask_ppo import MaskPPO
 from JaxSC2.env.env import JaxSC2Env
 
 
+class MaskedPPOTrainer(MaskPPO):
+    """Compatibility wrapper for the original train(total_steps) interface."""
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.env = JaxSC2Env(variant_name=self.config.get("VARIANT_NAME", "V1_Base"))
+
+    def train(self, total_steps):
+        return super().train(self.env, total_steps)
+
+
 def main():
     parser = argparse.ArgumentParser(description="MaskPPO Training")
     parser.add_argument("--gamma", type=float, default=0.995)

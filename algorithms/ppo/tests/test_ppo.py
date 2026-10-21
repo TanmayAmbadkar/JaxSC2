@@ -20,7 +20,7 @@ def test_ppo_loss_shape():
     def dummy_apply(p, x):
         return jnp.zeros((batch_size, 17)), jnp.zeros((batch_size,))
     
-    loss = ppo_loss(params, dummy_apply, obs, actions, old_logp, adv, ret, clip_eps=0.2)
+    loss, _ = ppo_loss(params, dummy_apply, obs, actions, old_logp, adv, ret, clip_eps=0.2)
     assert loss.shape == ()
     assert not jnp.isnan(loss)
 

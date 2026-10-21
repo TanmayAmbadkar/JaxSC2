@@ -56,8 +56,8 @@ damage = clamp(damage * multiplier + bonus - armor, min=0.5)
 Plus `bonus_matrix` shifting damage by +2 for certain type pairs. This creates a **rock-paper-scissors meta** that agents must learn to exploit.
 
 ### Map (`maps/twobridge.py`)
-- **32×32 grid** with cliff at x=0.5 forcing bridge crossing
-- **Two bridges** at y=(0.2–0.3) and (y=0.7–0.8) — only allies are terrain-constrained
+- **32×32 grid** with a ditch spanning x=(0.45–0.55), forcing bridge crossing
+- **Two bridges** at y=(0.2–0.3) and (y=0.7–0.8); both teams obey radius-aware swept terrain collisions
 - **6 regional spawn coordinates** for varied initial positioning
 
 Variants: V1(5v3), V2(5v5), V3(5v8) × {Base, Combat, Navigate} = 9 scenarios
