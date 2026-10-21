@@ -99,6 +99,9 @@ global step are restored; environments and partial episode counters restart.
 
 ### Scripted Beacon and Combat Baselines
 
+Browse the [scripted beacon and combat gallery](docs/SCRIPTED_AGENTS.md) directly
+on GitHub: 108 animated demos with side-by-side agents, settings, and outcomes.
+
 Run deterministic per-unit agents across all nine scenarios and the collision,
 armor, fog, and latency settings, with a GIF gallery and JSON metrics:
 
