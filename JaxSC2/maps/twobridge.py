@@ -17,6 +17,12 @@ class TwoBridgeMap:
     - Cliff/Bridge terrain constraints
     - Navigation and Combat reward shaping
     """
+    width, height, name = 32., 32., "TwoBridge"
+
+    def sample_positions(self, key, count, margin=2.):
+        from JaxSC2.maps.base import sample_positions
+        return sample_positions(self, key, count, margin)
+
     def __init__(self):
         # 32x32 Normalized Coordinates
         self.REGION_COORDS = jnp.array([
@@ -156,7 +162,7 @@ class TwoBridgeMap:
             recovered = candidates[jnp.arange(len(position)), closest]
             return jnp.where(inside[:, None], recovered, position)
 
-        start = jax.lax.fori_loop(0, 3, repair, start)
+        start = jax.lax.fori_loop(0, rectangles.shape[1], repair, start)
         desired = jnp.clip(next_pos, radius[:, None], limits - radius[:, None])
 
         def slide(_, carry):

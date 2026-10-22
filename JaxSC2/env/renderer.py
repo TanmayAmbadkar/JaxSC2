@@ -111,12 +111,13 @@ class ProductionRenderer:
 
     def _draw_dynamic_data(self, f1, f2, alpha, cp, zm):
         """Draw units, projectiles, beacon."""
+        teams = f2.get("unit_teams", np.where(np.arange(len(f2["unit_alive"])) < 5, 0, 1))
         if "beacon_pos" in f2:
             b_p = f2["beacon_pos"]
             sxb, syb = self.world_to_screen(b_p, cp, zm)
-            alive = f2["unit_alive"][:5]
+            alive = f2["unit_alive"] & (teams == 0)
             if np.any(alive):
-                idx = np.argmin(np.where(alive, np.linalg.norm(f2["unit_pos"][:5] - b_p, axis=1), 999))
+                idx = np.argmin(np.where(alive, np.linalg.norm(f2["unit_pos"] - b_p, axis=1), 999))
                 sxu, syu = self.world_to_screen(f2["unit_pos"][idx], cp, zm)
                 pygame.draw.line(self.screen, (0, 255, 255, 30), (sxb, syb), (sxu, syu), 1)
             p = (np.sin(alpha * np.pi) * 5)
@@ -134,11 +135,11 @@ class ProductionRenderer:
             if not f2["unit_alive"][t_idx]:
                 continue
             p1, p2 = self.world_to_screen(pos[i], cp, zm), self.world_to_screen(pos[t_idx], cp, zm)
-            attack_range = [1.5, 6.0, 4.0][f2["unit_types"][i]]
+            attack_range = f2["unit_ranges"][i]
             nr = np.linalg.norm(pos[i] - pos[t_idx]) < attack_range + .3
             if not nr or f2["attack_timers"][i] == 0:
                 continue
-            color = (130, 180, 255) if i < 5 else (255, 130, 130)
+            color = (130, 180, 255) if teams[i] == 0 else (255, 130, 130)
             a, w = (150, 3) if nr else (50, 1)
             pygame.draw.line(self.screen, (*color, a), p1, p2, w)
         
@@ -159,7 +160,7 @@ class ProductionRenderer:
             # decorative circles otherwise appear to hang over valid bridge edges.
             ry = max(1, int(r * .7))
             footprint = (bx-r, by-ry, r*2, ry*2)
-            pygame.draw.ellipse(self.screen, (*(COLOR_ALLY if i<5 else COLOR_ENEMY), ua), footprint)
+            pygame.draw.ellipse(self.screen, (*(COLOR_ALLY if teams[i] == 0 else COLOR_ENEMY), ua), footprint)
             pygame.draw.ellipse(self.screen, (0, 0, 0, ua), footprint, 1)
             pygame.draw.circle(self.screen, (255, 255, 255, ua), (bx, by), max(1, r//4))
             if hp2[i] < hp1[i] and alpha < 0.5:
@@ -168,7 +169,7 @@ class ProductionRenderer:
                 ang = -np.pi/2 + (f2["attack_timers"][i]/10.0 * 2 * np.pi)
                 px, py = bx+int(np.cos(ang)*(r+3)), by+int(np.sin(ang)*(r+3))
                 pygame.draw.circle(self.screen, (255,255,255), (px, py), 2)
-                mhp = [100., 45., 200.][f2["unit_types"][i]]
+                mhp = f2["unit_max_health"][i]
                 pygame.draw.rect(self.screen, (40, 40, 40), (bx-15, by-r-8, 30, 3))
                 pygame.draw.rect(self.screen, (100, 255, 100), (bx-15, by-r-8, int(30 * hp2[i]/mhp), 3))
                 v = (f2["unit_pos"][i] - f1["unit_pos"][i]) * 2.5
@@ -245,13 +246,16 @@ class ProductionRenderer:
         
         pygame.quit()
 
-def state_to_frame(state):
+def state_to_frame(state, unit_health=None, unit_ranges=None):
     s = state.smax_state
     return {
         "unit_pos": np.array(s.unit_positions),
         "unit_alive": np.array(s.unit_alive, dtype=bool),
         "unit_health": np.array(s.unit_health),
         "unit_types": np.array(s.unit_types),
+        "unit_teams": np.array(s.unit_teams),
+        "unit_max_health": np.asarray([100., 45., 200.] if unit_health is None else unit_health)[np.array(s.unit_types)],
+        "unit_ranges": np.asarray([1.5, 6., 4.] if unit_ranges is None else unit_ranges)[np.array(s.unit_types)],
         "unit_radius": np.full(len(s.unit_types), .6),
         "targets": np.array(state.persistent_targets),
         "attack_timers": np.array(state.attack_timers),

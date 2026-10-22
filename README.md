@@ -8,7 +8,8 @@ Sc2Jax is a lightweight, high-performance StarCraft II research framework built 
 - **High Throughput**: Achieves >110k SPS for raw environment steps and >17k SPS during multi-epoch PPO training on Apple Silicon.
 - **Tri-Algorithm Stack**: Production-ready implementations of **A2C**, **PPO**, and **MaskPPO** (with action-masking).
 - **Standalone Architecture**: Zero dependency on heavy external MARL libraries; local `base.py` provides all necessary abstractions.
-- **Physical Fidelity**: Includes continuous kinematics, projectile ballistics, and heterogeneous unit types (Melee, Ranged, Tank).
+- **Mechanics-Rich Simulation**: Includes continuous kinematics, finite-speed projectiles, and heterogeneous unit types.
+- **Composable Tasks**: Seven SC2-inspired task adaptations plus nine TwoBridge variants, with separate terrain, dynamics, objectives, and opponents.
 
 ## 🛠 Installation
 
@@ -28,6 +29,9 @@ export PYTHONPATH=$PYTHONPATH:.
 | **MaskPPO** | 32 | **19,046** |
 | **Standard PPO** | 32 | **17,057** |
 
+These measurements describe the original TwoBridge configurations, not the new
+task suite's larger entity capacities or economy/production simulations.
+
 ## 📖 Documentation
 
 | Resource | Description |
@@ -38,6 +42,7 @@ export PYTHONPATH=$PYTHONPATH:.
 | [Mechanics](JaxSC2/env/mechanics.md) | Physics equations: collisions, velocity integration, combat, fog of war |
 | [Unit Reference](JaxSC2/env/units.md) | Unit stats, weapons, type advantage matrix, design rationale |
 | [Map Authoring](JaxSC2/maps/README.md) | Map structure, variants, bridge strategy, creating custom maps |
+| [Task Suite](docs/TASK_SUITE.md) | Seven adaptations, composable architecture, entity observations, economy, and current limits |
 | [Test Suite](JaxSC2/tests/README.md) | Running tests, adding new tests, debugging JIT errors |
 | [Common Utilities](algorithms/common/README.md) | GAE, Welford RMS, action encoding, checkpointing |
 | [Visualizations](VISUALIZATIONS.md) | All demo scripts with CLI args, agent logic, customization guide |
@@ -114,6 +119,29 @@ not additional steps. Parameters, optimizer state, reward normalization, and
 global step are restored; environments and partial episode counters restart.
 
 ## 🎬 Visualizations
+
+### SC2-Inspired Task Suite
+
+The simulator now supports seven task adaptations in addition to TwoBridge:
+`MoveToBeacon`, `CollectMineralShards`, `FindAndDefeatZerglings`, `DefeatRoaches`,
+`DefeatZerglingsAndBanelings`, `CollectMineralsAndGas`, and `BuildMarines`.
+Terrain, physics/combat, objectives, and opponents are separate components, with
+masked capacities instead of assuming five allies and eight enemy slots.
+
+```python
+from JaxSC2 import make
+env = make("DefeatRoaches", max_steps=600)
+```
+
+```bash
+python -m JaxSC2.tasks.evaluate --seeds 42 --render all --output runs/task_suite_gallery
+```
+
+See the [task suite guide](docs/TASK_SUITE.md) for architecture, actions, economy,
+validation results, and limitations. These are simplified SC2-inspired tasks,
+not exact PySC2 ports. Economy tasks have scripted controllers and a macro-action
+API; learned macro-policy training is not yet implemented. Existing TwoBridge
+checkpoints and the original 63-dimensional observation remain supported.
 
 ### Scripted Beacon and Combat Baselines
 

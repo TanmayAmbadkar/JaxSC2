@@ -50,6 +50,8 @@ class PPO(BaseAlgorithm):
         self._pending_checkpoint = None
 
     def train(self, env: Any, total_steps: int):
+        if getattr(env, "economic", False):
+            raise ValueError("Economy tasks require a TaskAction policy with macro heads; standard PPO controls army actions only")
         config = self.config
         num_envs = config["NUM_ENVS"]
         rollout_len = config["ROLLOUT_LEN"]

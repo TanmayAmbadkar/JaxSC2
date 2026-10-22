@@ -45,6 +45,8 @@ class MaskPPO(BaseAlgorithm):
         self._pending_checkpoint = None
 
     def train(self, env: Any, total_steps: int):
+        if getattr(env, "economic", False):
+            raise ValueError("Economy tasks require a TaskAction policy with macro heads; MaskPPO controls army actions only")
         config = self.config
 
         num_envs = config["NUM_ENVS"]
@@ -70,7 +72,8 @@ class MaskPPO(BaseAlgorithm):
         tgt_mask = jnp.ones((1, num_enemies), dtype=jnp.bool_)
         if self.state is None:
             self.model = MaskedActorCritic(action_dim=17)
-            params = self.model.init(init_rng, jnp.zeros((1, 63)), dummy_mask, dir_mask, tgt_mask)
+            obs_dim = getattr(getattr(env, "observation_space", None), "shape", (63,))[0]
+            params = self.model.init(init_rng, jnp.zeros((1, obs_dim)), dummy_mask, dir_mask, tgt_mask)
             self.state = TrainState.create(
                 apply_fn=self.model.apply, params=params, tx=optax.adam(config["LR"])
             )

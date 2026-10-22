@@ -2,7 +2,7 @@
 
 ## What It Is
 
-JaxSC2 is a **fully differentiable, JIT-compiled StarCraft II combat simulator** built on JAX. It's a mini-environment for learning multi-agent decision-making with SC2-like mechanics: unit movement, targeting, combat windup/cooldown, fog of war, terrain bridges, and type advantages — all vectorized across batches with `jax.vmap` and compiled with `@jax.jit`.
+JaxSC2 is a **JAX-native, JIT-compiled SC2-inspired RTS simulator**. It supports unit movement, targeting, combat windup/cooldown, fog memory, terrain constraints, and type advantages, with `jax.vmap` batching. Discrete targeting, deaths, and task events mean the complete simulator is not claimed to be end-to-end differentiable.
 
 ---
 
@@ -247,3 +247,22 @@ Agents don't see invisible enemies. The FogState tracks last-seen position, crea
 5. **Gym wrapper converts to MultiDiscrete([2,3,8,8])** — The `who_mask` is encoded as a bitmask (0 or 1), while the other three dims are independent finite alphabets. Compatible with standard Gym-based RL libraries but loses sparse structure of PerUnitAction.
 
 6. **FogState tracks `time`** — How long since an enemy was last seen. This isn't used directly in the observation but could be extended for temporal reasoning about hidden units.
+
+## Composable Task Suite Extension
+
+`JaxSC2.make(name)` constructs either an original TwoBridge environment or a new
+SC2-inspired mini-game adaptation. See [the task suite guide](docs/TASK_SUITE.md)
+for exact API, reward, action, capacity, and fidelity specifications.
+
+- `maps/base.py`: terrain protocol and rectangular arena geometry.
+- `JaxSC2Env.advance`: shared world dynamics without task rewards/termination.
+- `tasks/env.py`: composition, episode lifecycle, entity observations, masks.
+- `tasks/objectives.py`: beacon, shards, search, and combat-wave transitions.
+- `tasks/economy.py`: harvesting, cargo/deposits, construction, supply, production.
+- `env/enemy_ai.py`: independently selected opponent controllers.
+
+Static masked capacities preserve JAX batching while allowing different rosters,
+reinforcements, and production. The legacy TwoBridge `step` remains a task wrapper
+around the same simulator and retains its 63-dimensional standard observation.
+The new economy tasks need a macro-action learner; army-only PPO is explicitly
+unsupported there. New tasks are adaptations, not SC2 binary-map imports.

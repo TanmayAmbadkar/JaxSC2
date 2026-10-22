@@ -176,16 +176,24 @@ class JaxSC2Env:
         - target_mask:    (N, num_enemies) - only visible & alive enemies
     """
     def __init__(self, variant_name="V2_Base", use_spatial_obs=False, resolution=64, latency_delay=0,
-                 reward_profile="balanced", **kwargs):
+                 reward_profile="balanced", map_instance=None, variant_config=None,
+                 units=None, max_enemy_slots=None, projectile_capacity=32, **kwargs):
         if reward_profile not in REWARD_PROFILES:
             raise ValueError(f"Unknown reward profile: {reward_profile}")
         self.reward_profile = reward_profile
         self.reward_weights = dict(REWARD_PROFILES[reward_profile])
-        self.map_instance = TwoBridgeMap()
-        self.variant_config = self.map_instance.VARIANTS[variant_name]
+        self.map_instance = map_instance if map_instance is not None else TwoBridgeMap()
+        self.variant_config = (variant_config if variant_config is not None
+                               else self.map_instance.VARIANTS[variant_name])
         self.num_allies = self.variant_config.n_ally
         self.num_enemies = self.variant_config.n_enemy
         self.num_units = self.num_allies + self.num_enemies
+        if self.num_allies < 1 or self.num_enemies < 1 or projectile_capacity < 1:
+            raise ValueError("World capacities must be positive; represent absent units with alive masks")
+        self.max_enemy_slots = max(self.num_enemies, 8) if max_enemy_slots is None else max_enemy_slots
+        if self.max_enemy_slots < self.num_enemies:
+            raise ValueError("Observation enemy capacity cannot be smaller than world capacity")
+        self.projectile_capacity = projectile_capacity
         
         self.use_spatial_obs = use_spatial_obs
         self.resolution = resolution
@@ -209,8 +217,8 @@ class JaxSC2Env:
         )
         
         self.max_steps = 300
-        self.map_width = self.smax_env.map_width
-        self.map_height = self.smax_env.map_height
+        self.map_width = getattr(self.map_instance, "width", self.smax_env.map_width)
+        self.map_height = getattr(self.map_instance, "height", self.smax_env.map_height)
         self.map_dimensions = jnp.array([self.map_width, self.map_height])
         
         self.unit_teams = jnp.concatenate([
@@ -227,7 +235,8 @@ class JaxSC2Env:
         self.vision_radius = 6.0
         
         # Unit Heterogeneity Schema (Melee, Ranged, Tank)
-        self.units = [MeleeUnit(), RangedUnit(), TankUnit()]
+        custom_units = units is not None
+        self.units = list(units) if custom_units else [MeleeUnit(), RangedUnit(), TankUnit()]
         
         # Aggregate stats into JAX arrays for simulation
         self.unit_type_hp = jnp.array([u.max_hp for u in self.units])
@@ -235,7 +244,7 @@ class JaxSC2Env:
         self.unit_type_speed = jnp.array([u.speed for u in self.units])
         self.unit_type_accel = jnp.array([u.accel for u in self.units])
         self.unit_type_damage = jnp.array([u.weapon.damage for u in self.units])
-        self.type_radius = jnp.array([self.unit_radius] * 3)
+        self.type_radius = jnp.array([self.unit_radius] * len(self.units))
         self.type_mass = jnp.array([u.mass for u in self.units])
         self.unit_armor = jnp.array([u.armor for u in self.units])
 
@@ -262,6 +271,9 @@ class JaxSC2Env:
             "type_windups": jnp.array([u.weapon.windup for u in self.units]),
             "type_cooldowns": jnp.array([u.weapon.cooldown for u in self.units]),
         }
+        if custom_units:
+            self.combat_cfg["damage_matrix"] = jnp.ones((len(self.units), len(self.units)))
+            self.combat_cfg["bonus_matrix"] = jnp.zeros((len(self.units), len(self.units)))
         # Hoist constants for JIT efficiency
         self._angles = jnp.linspace(0, 2*jnp.pi, 8, endpoint=False)
         
@@ -272,7 +284,8 @@ class JaxSC2Env:
         self._not_self_mask = (i_idx != j_idx).astype(jnp.float32)
         
         # SB3-style Space definitions (Native)
-        self.observation_space = DictWrapper({"shape": (63,)})
+        obs_dim = 4 * self.num_allies + 5 * self.max_enemy_slots + 3
+        self.observation_space = DictWrapper({"shape": (obs_dim,)})
         self.action_space = DictWrapper({
             "nvec": jnp.array([2, 3, 8, 8]), 
             "n": 17
@@ -304,7 +317,7 @@ class JaxSC2Env:
             
             offsets = jax.random.uniform(rng_o, (num, 2), minval=-1.5, maxval=1.5)
             pos = jnp.stack([cx, cy], axis=-1) + offsets
-            return jnp.clip(pos, 0.05, 31.95)
+            return jnp.clip(pos, .05, jnp.array([self.map_width, self.map_height]) - .05)
 
         ally_pos = sample_dense(rng_ally_pos, a_global_idx, self.num_allies)
         enemy_pos = sample_dense(rng_enemy_pos, e_global_idx, self.num_enemies)
@@ -364,13 +377,13 @@ class JaxSC2Env:
             unit_velocities=jnp.zeros((self.num_units, 2)),
             attack_timers=jnp.zeros(self.num_units, dtype=jnp.int32),
             persistent_targets=jnp.ones(self.num_units, dtype=jnp.int32) * -1,
-            proj_pos=jnp.zeros((32, 2)),
-            proj_vel=jnp.zeros((32, 2)),
-            proj_target=jnp.ones(32, dtype=jnp.int32) * -1,
-            proj_damage=jnp.zeros(32),
-            proj_active=jnp.zeros(32, dtype=jnp.bool_),
-            proj_team=jnp.zeros(32, dtype=jnp.int32),
-            proj_types=jnp.full(32, -1, dtype=jnp.int32),
+            proj_pos=jnp.zeros((self.projectile_capacity, 2)),
+            proj_vel=jnp.zeros((self.projectile_capacity, 2)),
+            proj_target=jnp.ones(self.projectile_capacity, dtype=jnp.int32) * -1,
+            proj_damage=jnp.zeros(self.projectile_capacity),
+            proj_active=jnp.zeros(self.projectile_capacity, dtype=jnp.bool_),
+            proj_team=jnp.zeros(self.projectile_capacity, dtype=jnp.int32),
+            proj_types=jnp.full(self.projectile_capacity, -1, dtype=jnp.int32),
             fog_state=fog_state,
             action_buffer=action_buffer,
             enemy_visible=visible,
@@ -381,7 +394,8 @@ class JaxSC2Env:
         
         return self.get_obs(state), state
 
-    def step(self, rng: chex.PRNGKey, state: JaxSC2State, action: PerUnitAction) -> Tuple[Union[jnp.ndarray, Dict], JaxSC2State, float, bool, dict]:
+    def advance(self, rng, state, action):
+        """Advance only simulation dynamics; tasks own reward and termination."""
         # 1. Action Latency Buffer
         new_buffer, exec_action = push_and_pop_actions(state.action_buffer, action)
         
@@ -573,6 +587,27 @@ class JaxSC2Env:
             )
         new_visibility = fog_visibility & enemy_alive
         
+        world = state.replace(
+            smax_state=state.smax_state.replace(
+                unit_positions=next_pos, unit_alive=next_alive, unit_health=next_hp,
+                unit_weapon_cooldowns=jnp.zeros_like(state.smax_state.unit_weapon_cooldowns),
+                prev_movement_actions=jnp.zeros_like(state.smax_state.prev_movement_actions),
+                prev_attack_actions=jnp.zeros_like(state.smax_state.prev_attack_actions),
+                time=state.timestep + 1, terminal=False),
+            unit_velocities=next_vel, attack_timers=next_timers, persistent_targets=next_targets,
+            proj_pos=next_proj_st[0], proj_vel=next_proj_st[1], proj_target=next_proj_st[2],
+            proj_damage=next_proj_st[3], proj_active=next_proj_st[4],
+            proj_team=next_proj_st[5], proj_types=next_proj_st[6],
+            fog_state=next_fog_state, action_buffer=new_buffer, enemy_visible=new_visibility,
+            enemy_alerted=enemy_orders.alerted, timestep=state.timestep + 1)
+        return world, {"dropped_shots": dropped_shots}
+
+    def step(self, rng, state, action):
+        """Compatibility TwoBridge task; other tasks call advance directly."""
+        next_state, physics_info = self.advance(rng, state, action)
+        next_pos = next_state.smax_state.unit_positions
+        next_hp = next_state.smax_state.unit_health
+        next_alive = next_state.smax_state.unit_alive
         # 10. Compute Rewards
         dims = jnp.array([self.map_width, self.map_height])
         ally_pos_obs = next_pos[:self.num_allies]
@@ -635,43 +670,11 @@ class JaxSC2Env:
             "terminal_reward": terminal_reward,
         }
         
-        # 12. Build Next State
-        next_state = JaxSC2State(
-            smax_state=SmaxState(
-                unit_positions=next_pos,
-                unit_alive=next_alive,
-                unit_teams=self.unit_teams,
-                unit_health=next_hp,
-                unit_types=state.smax_state.unit_types,
-                unit_weapon_cooldowns=jnp.zeros_like(state.smax_state.unit_weapon_cooldowns),
-                prev_movement_actions=jnp.zeros_like(state.smax_state.prev_movement_actions),
-                prev_attack_actions=jnp.zeros_like(state.smax_state.prev_attack_actions),
-                time=state.timestep + 1,
-                terminal=done,
-            ),
-            beacon_pos=state.beacon_pos,
-            prev_mean_dist=mean_dist,
-            prev_enemy_health=current_enemy_hp,
-            prev_ally_health=current_ally_hp,
-            prev_enemy_dist=dist_to_combat_centroid,
-            unit_velocities=next_vel,
-            attack_timers=next_timers,
-            persistent_targets=next_targets,
-            proj_pos=next_proj_st[0],
-            proj_vel=next_proj_st[1],
-            proj_target=next_proj_st[2],
-            proj_damage=next_proj_st[3],
-            proj_active=next_proj_st[4],
-            proj_team=next_proj_st[5],
-            proj_types=next_proj_st[6],
-            fog_state=next_fog_state,
-            action_buffer=new_buffer,
-            enemy_visible=new_visibility,
-            enemy_home=state.enemy_home,
-            enemy_alerted=enemy_orders.alerted,
-            timestep=state.timestep + 1,
-        )
-        
+        next_state = next_state.replace(
+            smax_state=next_state.smax_state.replace(terminal=done),
+            prev_mean_dist=mean_dist, prev_enemy_health=current_enemy_hp,
+            prev_ally_health=current_ally_hp, prev_enemy_dist=dist_to_combat_centroid)
+        info.update(physics_info)
         return self.get_obs(next_state), next_state, total_reward, done, info
 
     def get_enemy_actions(self, state: JaxSC2State, rng=None) -> jnp.ndarray:
@@ -693,10 +696,11 @@ class JaxSC2Env:
             **self.build_spatial_features(state)
         }
 
-    def build_vector_obs(self, state: JaxSC2State, max_enemies=8) -> jnp.ndarray:
+    def build_vector_obs(self, state: JaxSC2State, max_enemies=None) -> jnp.ndarray:
         """
         SC2-semantics-aligned observation (63-dim, invariant across variants)
         """
+        max_enemies = self.max_enemy_slots if max_enemies is None else max_enemies
         s = state.smax_state
         dims = self.map_dimensions
 
@@ -776,7 +780,7 @@ class JaxSC2Env:
         
         target_mask = jnp.concatenate([
             e_visible_alive.astype(jnp.float32),
-            jnp.zeros(8 - self.num_enemies)
+            jnp.zeros(self.max_enemy_slots - self.num_enemies)
         ])
 
         direction_mask = jnp.ones(8, dtype=jnp.float32)
@@ -795,7 +799,7 @@ class JaxSC2Env:
         res = self.resolution
         smax_state = state.smax_state
 
-        TYPE_MAP = jnp.array([1.0, 2.0, 3.0])
+        TYPE_MAP = jnp.arange(1, len(self.units) + 1, dtype=jnp.float32)
         ally_types = TYPE_MAP[smax_state.unit_types[:self.num_allies]]
         enemy_types = TYPE_MAP[smax_state.unit_types[self.num_allies:]]
 
@@ -953,8 +957,11 @@ class JaxSC2GymEnv(gym.Env):
         max_cooldown = float(jnp.max(
             (self.env.combat_cfg["type_windups"] + self.env.combat_cfg["type_cooldowns"] - 1)
             / self.env.combat_cfg["type_windups"]))
-        low = np.array([-1., -1., 0., 0.] * 13 + [0.] * 8 + [-1., -1., 0.], dtype=np.float32)
-        high = np.array([1.] * 20 + [1., 1., 1., max_cooldown] * 8 + [1.] * 11, dtype=np.float32)
+        enemy_slots = self.env.max_enemy_slots
+        low = np.array([-1., -1., 0., 0.] * (self.num_allies + enemy_slots)
+                       + [0.] * enemy_slots + [-1., -1., 0.], dtype=np.float32)
+        high = np.array([1.] * (4 * self.num_allies) + [1., 1., 1., max_cooldown] * enemy_slots
+                        + [1.] * (enemy_slots + 3), dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
         self.action_space = gym.spaces.MultiDiscrete([1 << self.num_allies, 3, 8, self.num_enemies])
         

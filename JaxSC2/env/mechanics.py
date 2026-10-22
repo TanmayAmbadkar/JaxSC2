@@ -266,6 +266,20 @@ def apply_high_fidelity_combat(
     
     new_health = jnp.clip(unit_health - damage_to_apply, 0.0, 200.0)
     new_alive = new_health > 0
+    if "suicide_type" in combat_cfg:
+        # Optional archetype effect shared by either team. Dead units cannot
+        # detonate; multiple blasts add, with no friendly-fire damage.
+        distances = jnp.linalg.norm(unit_positions[:, None, :] - unit_positions[None, :, :], axis=-1)
+        hostile = unit_teams[:, None] != unit_teams[None, :]
+        triggered = (new_alive & (unit_types == combat_cfg["suicide_type"]) &
+                     jnp.any(hostile & new_alive[None, :] &
+                             (distances < combat_cfg["suicide_trigger"]), axis=1))
+        blasts = (triggered[:, None] & hostile &
+                  (distances < combat_cfg["suicide_radius"]))
+        new_health = jnp.maximum(0., new_health -
+                                 jnp.sum(blasts, axis=0) * combat_cfg["suicide_damage"])
+        new_health = jnp.where(triggered, 0., new_health)
+        new_alive = new_health > 0
     final_proj_state = (p_pos, p_vel, p_target, p_damage, p_active, p_team, p_types)
     
     return new_health, new_alive, new_timers, final_proj_state, dropped_shots
