@@ -16,6 +16,7 @@ import traceback
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
+from JaxSC2.env.enemy_ai import ENEMY_MODES
 
 
 def main():
@@ -24,18 +25,21 @@ def main():
     parser.add_argument("--total-steps", type=int, default=30_000_000)
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--rollout-len", type=int, default=500)
+    parser.add_argument("--max-episode-steps", "--max-steps", type=int, default=300,
+                        help="Episode horizon for both training and evaluation (default: 300)")
     parser.add_argument("--update-epochs", type=int, default=10)
     parser.add_argument("--num-minibatches", type=int, default=16)
     parser.add_argument("--checkpoint-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=25)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--enemy-mode", choices=["static", "guard", "patrol", "aggressive"], default="guard")
+    parser.add_argument("--reward-profile", choices=["legacy", "balanced"], default="balanced")
+    parser.add_argument("--enemy-mode", choices=ENEMY_MODES, default="guard")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--resume", type=Path, help="Resume weights/optimizer state toward the total target step count")
     parser.add_argument("--background", action="store_true")
     args = parser.parse_args()
     if min(args.total_steps, args.num_envs, args.rollout_len, args.update_epochs,
-           args.num_minibatches, args.checkpoint_interval) < 1 or args.eval_interval < 0:
+           args.num_minibatches, args.checkpoint_interval, args.max_episode_steps) < 1 or args.eval_interval < 0:
         parser.error("Training sizes and checkpoint interval must be positive; evaluation interval may be zero")
     batch = args.num_envs * args.rollout_len
     if batch % args.num_minibatches:
@@ -82,7 +86,9 @@ def main():
     if (run_dir / "config.json").exists() and args.resume is None:
         raise FileExistsError(f"Run already exists: {run_dir}")
     env = JaxSC2Env(args.variant, enemy_ai=True, enemy_mode=args.enemy_mode,
-                   enable_collision=True, enable_armor=True, enable_fow=False)
+                   enable_collision=True, enable_armor=True, enable_fow=False,
+                   reward_profile=args.reward_profile)
+    env.max_steps = args.max_episode_steps
     model = PPO({
         "NUM_ENVS": args.num_envs, "ROLLOUT_LEN": args.rollout_len,
         "UPDATE_EPOCHS": args.update_epochs, "NUM_MINIBATCHES": args.num_minibatches,
@@ -96,6 +102,7 @@ def main():
         "enemy_mode": args.enemy_mode, "enable_collision": True,
         "enable_armor": True, "enable_fow": False, "max_episode_steps": env.max_steps,
         "requested_steps": args.total_steps, "target_steps": target,
+        "reward_profile": env.reward_profile, "reward_weights": env.reward_weights,
         "config": model.config, "devices": [str(device) for device in jax.devices()],
         "python": sys.executable, "jax_version": jax.__version__,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -104,9 +111,14 @@ def main():
         (run_dir / "config.json").write_text(json.dumps(metadata, indent=2))
     else:
         original = json.loads((run_dir / "config.json").read_text())
-        keys = ("variant", "enemy_mode", "enable_collision", "enable_armor", "enable_fow", "target_steps")
+        keys = ("variant", "enemy_mode", "enable_collision", "enable_armor", "enable_fow",
+                "max_episode_steps", "target_steps")
         if any(original[key] != metadata[key] for key in keys) or original["config"] != model.config:
             raise ValueError("Resume arguments must match the existing run configuration")
+        # Runs created before reward versioning used the legacy weights.
+        if (original.get("reward_profile", "legacy") != env.reward_profile or
+                original.get("reward_weights", env.reward_weights) != env.reward_weights):
+            raise ValueError("Cannot resume a run with different reward weights; use its original reward profile")
     (run_dir / "pid").write_text(str(os.getpid()) + "\n")
 
     def status(state, **extra):

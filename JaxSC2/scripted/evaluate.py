@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from JaxSC2.env.env import JaxSC2Env
+from JaxSC2.env.enemy_ai import ENEMY_MODES
 from JaxSC2.maps.twobridge import TwoBridgeMap
 from JaxSC2.scripted.agents import beacon_agent, combat_agent
 
@@ -167,8 +168,9 @@ def main():
     parser.add_argument("--variants", nargs="+", default=["all"])
     parser.add_argument("--settings", nargs="+", default=["all"])
     parser.add_argument("--enemy-modes", "--enemy-mode", nargs="+",
-                        choices=["all", "static", "guard", "patrol", "aggressive"], default=["static"])
+                        choices=["all", *ENEMY_MODES], default=["static"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[42])
+    parser.add_argument("--reward-profile", choices=["legacy", "balanced"], default="balanced")
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--output", type=Path, default=Path("runs/scripted_evaluation"))
     parser.add_argument("--render", choices=["none", "baseline", "all"], default="baseline")
@@ -181,11 +183,12 @@ def main():
         parser.error("Unknown variant or setting")
     args.output.mkdir(parents=True, exist_ok=True)
     rows = []
-    modes = ["static", "guard", "patrol", "aggressive"] if "all" in args.enemy_modes else args.enemy_modes
+    modes = ENEMY_MODES if "all" in args.enemy_modes else args.enemy_modes
     for setting in settings:
         for variant in variants:
             for mode in modes:
-                env = JaxSC2Env(variant, enemy_ai=True, enemy_mode=mode, **SETTINGS[setting])
+                env = JaxSC2Env(variant, enemy_ai=True, enemy_mode=mode,
+                               reward_profile=args.reward_profile, **SETTINGS[setting])
                 env.max_steps = args.max_steps
                 rollout = make_rollout(env)
                 for seed in args.seeds:
@@ -194,7 +197,8 @@ def main():
                         row.update(variant=variant, setting=setting, enemy_mode=mode,
                                    max_steps=args.max_steps, enable_collision=env.enable_collision,
                                    enable_armor=env.enable_armor, enable_fow=env.enable_fow,
-                                   latency_delay=env.latency_delay)
+                                   latency_delay=env.latency_delay,
+                                   reward_profile=env.reward_profile, reward_weights=env.reward_weights)
                         if args.render == "all" or (args.render == "baseline" and setting == "baseline"):
                             name = f'{variant}_{row["agent"]}_{setting}_{mode}_{seed}.gif'
                             render_gif(env, episode, row, args.output / name)

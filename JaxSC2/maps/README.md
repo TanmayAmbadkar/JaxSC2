@@ -72,40 +72,33 @@ The two-bridge design creates natural choke points that agents must learn to exp
 
 ---
 
-## ⚖️ Rewards (`rewards.py`)
+## ⚖️ Rewards
 
-The `compute_rewards_and_dones` function (in `env.py`, not a separate file in the current structure) implements the multi-objective reward signal:
+`JaxSC2Env.step` computes rewards using versioned weights from
+[`env/rewards.py`](../env/rewards.py). The default profile is `balanced`;
+`JaxSC2Env(..., reward_profile="legacy")` retains the previous training setup.
 
-### Reward Components
-
-```python
-# 1. Navigation shaping (dense, high weight)
-nav_reward = (prev_dist_to_beacon - new_dist_to_beacon) * 2.0
-# Encourages moving toward the beacon every step
-
-# 2. Combat shaping (sparse, moderate weight)
-enemy_dmg_reward = (prev_hp - curr_hp) * 0.01 * 0.5
-# Reward for dealing damage to enemies (scaled by health differential)
-
-# 3. Friendly fire / being hit penalty
-ally_dmg_penalty = -damage_taken_by_allies
-# Penalizes losing HP (not just damage dealt, but also damage received)
-
-# 4. Kill bonus (sparse, flat)
-enemy_killed_reward = 0.2 per unit killed
-# One-time bonus when an enemy's HP drops to zero
-
-# Total reward = nav_reward + enemy_dmg_reward + ally_dmg_penalty + enemy_killed_reward
-```
-
-### Weight Rationale
-
-| Component | Multiplier | Why this weight? |
+| Component | Balanced (default) | Legacy |
 |---|---|---|
-| `nav_reward` | ×2.0 | Primary signal for Navigate/Base modes; needs to be strong enough to overcome exploration noise |
-| `enemy_dmg` | ×0.5 × 0.01 | Scaled down because raw HP numbers (45-200) are large; 0.5 prevents combat from dominating navigation |
-| `ally_dmg_penalty` | -1.0× | Direct penalty — no scaling needed since it's already a loss signal; keeps agents from suicidal behavior |
-| `enemy_killed` | +0.2 flat | Sparse but substantial enough to signal "win" when combined with nav_reward |
+| Decrease in mean beacon distance | ×2.0 | ×2.0 |
+| Decrease in mean distance to enemy centroid | ×2.0 | ×0.5 |
+| Reach beacon (terminal) | +25 | +25 |
+| Defeat all enemies (terminal) | +25 | +10 |
+| Enemy HP removed | +0.005/HP | +0.005/HP |
+| Allied HP lost | -0.005/HP | -0.005/HP |
+| Enemy killed | +0.2 | +0.2 |
+| All allies defeated (terminal) | -10 | -10 |
+| Timeout (terminal) | -15 | -15 |
+
+Distances are normalized by map dimensions and averaged over living allies.
+Enemy-centroid approach is dense shaping, separate from damage and kill rewards.
+Moving away produces negative shaping. Total reward is the sum of both approach
+terms, damage/kill terms, and the applicable terminal bonus. Simultaneous beacon
+and combat success receives one +25 bonus, not +50.
+
+All variants use these same weights; Base/Combat/Navigate affect spawn layouts,
+not task-specific victory conditions. Equal weights remove the explicit bonus
+imbalance but do not remove differences in task difficulty, risk, or duration.
 
 ### Done Conditions
 
@@ -113,8 +106,8 @@ An episode ends (and returns a done flag) when **any** of these conditions is me
 
 | Condition | Trigger | Rationale |
 |---|---|---|
-| `beacon_reached` | Any ally reaches beacon position | Success for Navigate/Base modes |
-| `enemies_dead` | All enemies have HP ≤ 0 | Success for Combat/Base modes (zero-sum) |
+| `beacon_reached` | Any living ally within normalized distance 0.05 | Navigation success in every variant |
+| `enemies_dead` | All enemies have HP ≤ 0 | Combat success in every variant |
 | `allies_dead` | All allies have HP ≤ 0 | Failure — agent lost the engagement |
 | `timestep >= 300` | Timeout | Prevents infinite episodes; ~15 seconds of simulation at 20 steps/sec equivalent |
 

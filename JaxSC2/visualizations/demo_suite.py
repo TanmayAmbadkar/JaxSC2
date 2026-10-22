@@ -21,6 +21,7 @@ import numpy as np
 import os
 import sys
 from JaxSC2.env.env import JaxSC2Env, CentralAction
+from JaxSC2.env.enemy_ai import ENEMY_MODES
 from JaxSC2.env.renderer import ProductionRenderer, state_to_frame
 
 OUTPUT_DIR = "JaxSC2/visualizations/output"
@@ -208,7 +209,7 @@ def run_all_demos(mode_filter=None, variant_filter=None):
         variant_filter: e.g., "V1_Base" for single variant, or None for all
     """
     variants = ["V1_Base", "V2_Combat", "V3_Navigate"]
-    enemy_modes = ["static", "guard", "patrol", "aggressive"]
+    enemy_modes = ENEMY_MODES
     
     print("=" * 70)
     print("JaxSC2 Demo Suite — Full Episode Visualizations")
@@ -269,7 +270,7 @@ def run_all_demos(mode_filter=None, variant_filter=None):
             
             # Generate filename
             mode_short = {"combat": "C", "navigate": "N"}.get(mode_type, "?")
-            filename = f"{variant}_{enemy_mode[:4]}{mode_short}_full.gif"
+            filename = f"{variant}_{enemy_mode}_{mode_short}_full.gif"
             
             save_gif(trajectory, metadata, filename)
         except Exception as e:

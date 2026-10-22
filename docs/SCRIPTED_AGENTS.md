@@ -5,6 +5,7 @@
 This is the GitHub-readable Markdown version of the local HTML evaluation galleries.
 These are deterministic scripted baselines, **not trained PPO policies**. Each beacon/combat
 pair uses the same spawn seed (42), with a maximum of 300 simulation steps.
+This recorded snapshot uses the `legacy` reward profile, before reward balancing.
 
 The **beacon agent** routes through bridges toward the beacon. The **combat agent**
 approaches enemies and attacks within weapon range. Blue units are allies, red units
@@ -149,11 +150,11 @@ From the repository root, using the `twobridge` environment:
 
 ```bash
 conda run --no-capture-output -n twobridge env PYTHONPATH=. \
-  python -m JaxSC2.scripted.evaluate --render all
+  python -m JaxSC2.scripted.evaluate --render all --reward-profile legacy
 
 conda run --no-capture-output -n twobridge env PYTHONPATH=. \
   python -m JaxSC2.scripted.evaluate \
-  --variants V1_Combat V2_Combat V3_Combat --settings baseline \
+  --variants V1_Combat V2_Combat V3_Combat --settings baseline --reward-profile legacy \
   --enemy-modes guard patrol aggressive --render all \
   --output runs/scripted_opponents
 ```

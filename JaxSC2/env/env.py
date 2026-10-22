@@ -19,6 +19,8 @@ from JaxSC2.env.mechanics import (
     FogState
 )
 from JaxSC2.env.units import MeleeUnit, RangedUnit, TankUnit
+from JaxSC2.env.rewards import REWARD_PROFILES
+from JaxSC2.env.enemy_ai import ENEMY_MODES, COMBAT_ENEMY_MODES, get_enemy_orders, idle_orders
 
 @dataclass
 class ActionBuffer:
@@ -48,6 +50,8 @@ class JaxSC2State:
     fog_state: FogState
     action_buffer: ActionBuffer
     enemy_visible: jnp.ndarray # (num_enemies,)
+    enemy_home: jnp.ndarray  # initial positions: stable defensive bank/anchors
+    enemy_alerted: jnp.ndarray  # latched ambush activation, reset each episode
     timestep: int = 0
 
 def init_action_buffer(delay, num_units):
@@ -171,7 +175,12 @@ class JaxSC2Env:
         - direction_mask: (N, 8) - all directions valid if alive
         - target_mask:    (N, num_enemies) - only visible & alive enemies
     """
-    def __init__(self, variant_name="V2_Base", use_spatial_obs=False, resolution=64, latency_delay=0, **kwargs):
+    def __init__(self, variant_name="V2_Base", use_spatial_obs=False, resolution=64, latency_delay=0,
+                 reward_profile="balanced", **kwargs):
+        if reward_profile not in REWARD_PROFILES:
+            raise ValueError(f"Unknown reward profile: {reward_profile}")
+        self.reward_profile = reward_profile
+        self.reward_weights = dict(REWARD_PROFILES[reward_profile])
         self.map_instance = TwoBridgeMap()
         self.variant_config = self.map_instance.VARIANTS[variant_name]
         self.num_allies = self.variant_config.n_ally
@@ -184,12 +193,9 @@ class JaxSC2Env:
         
         self.enemy_ai = kwargs.pop("enemy_ai", False)
         self.enemy_mode = kwargs.pop("enemy_mode", "guard")
-        self.mode_id = {
-            "static": 0,
-            "guard": 1,
-            "patrol": 2,
-            "aggressive": 3
-        }.get(self.enemy_mode, 1)
+        if self.enemy_mode not in ENEMY_MODES:
+            raise ValueError(f"Unknown enemy mode {self.enemy_mode!r}; choose from {ENEMY_MODES}")
+        self.mode_id = ENEMY_MODES.index(self.enemy_mode)
         
         # Initialize SMAX
         smax_combat_cfg = {}
@@ -368,6 +374,8 @@ class JaxSC2Env:
             fog_state=fog_state,
             action_buffer=action_buffer,
             enemy_visible=visible,
+            enemy_home=enemy_pos,
+            enemy_alerted=jnp.zeros(self.num_enemies, dtype=jnp.bool_),
             timestep=0
         )
         
@@ -380,17 +388,14 @@ class JaxSC2Env:
         # Get Actions - Enemy AI or default
         new_key, rng_enemy = jax.random.split(rng)
         
-        enemy_actions = jax.lax.cond(
+        enemy_orders = jax.lax.cond(
             self.enemy_ai,
-            lambda _: self.get_enemy_actions(state, rng_enemy),
-            lambda _: jnp.ones(self.num_enemies, dtype=jnp.int32) * 4,
+            lambda _: self.get_enemy_orders(state, rng_enemy),
+            lambda _: idle_orders(self, state),
             operand=None
         )
         
-        # Translate enemy actions to verb/dir — always (N_enemies,) inside vmap
-        e_verb = jnp.where(enemy_actions < 4, 1, 0)
-        e_verb = jnp.where(enemy_actions >= 5, 2, e_verb)
-        e_dir = jnp.where(enemy_actions < 4, enemy_actions * 2, 0)
+        e_verb, e_dir = enemy_orders.verb, enemy_orders.direction
 
         # Concatenate ally + enemy — always (N_total,) inside vmap; vmap adds B automatically
         ally_verb = exec_action.verb       # (N_allies,)
@@ -518,6 +523,11 @@ class JaxSC2Env:
         next_targets = current_targets.at[:self.num_allies].set(
             jnp.where(manual_targets >= 0, manual_targets, current_targets[:self.num_allies])
         )
+        if self.enemy_mode in COMBAT_ENEMY_MODES:
+            # Explicit targets enable coordinated focus fire and suppression
+            # before an ambush triggers. Disabled AI retains legacy auto-attack.
+            next_targets = next_targets.at[self.num_allies:].set(jnp.where(
+                self.enemy_ai, enemy_orders.target, next_targets[self.num_allies:]))
         
         # 7. High-Fidelity Combat
         unit_armor_per_unit = (self.unit_armor[state.smax_state.unit_types]
@@ -573,7 +583,8 @@ class JaxSC2Env:
         # Navigation Reward (Distance to Beacon)
         dist_to_beacon = jnp.linalg.norm((ally_pos_obs - state.beacon_pos) / dims, axis=-1)
         mean_dist = jnp.sum(dist_to_beacon * ally_alive_obs) / jnp.maximum(jnp.sum(ally_alive_obs), 1.0)
-        nav_reward = (state.prev_mean_dist - mean_dist) * 2.0
+        weights = self.reward_weights
+        nav_reward = (state.prev_mean_dist - mean_dist) * weights["navigation_progress"]
         
         # Combat shaping: bidirectional distance to enemy centroid (Panda et al., ICML 2026)
         alive_enemy_float = enemy_alive_obs.astype(jnp.float32)
@@ -582,17 +593,17 @@ class JaxSC2Env:
             jnp.sum(jnp.linalg.norm((ally_pos_obs - combat_centroid) / dims, axis=-1) * ally_alive_obs.astype(jnp.float32), axis=0)
             / jnp.maximum(jnp.sum(ally_alive_obs.astype(jnp.float32)), 1.0)
         )
-        combat_shaping = (state.prev_enemy_dist - dist_to_combat_centroid) * 0.5
+        combat_shaping = (state.prev_enemy_dist - dist_to_combat_centroid) * weights["combat_progress"]
         
         # Combat Reward (HP Damage + Kills)
         current_enemy_hp = jnp.sum(next_hp[self.num_allies:] * enemy_alive_obs)
-        enemy_dmg_reward = (state.prev_enemy_health - current_enemy_hp) * 0.01 * 0.5
+        enemy_dmg_reward = (state.prev_enemy_health - current_enemy_hp) * weights["enemy_damage"]
         
         current_ally_hp = jnp.sum(next_hp[:self.num_allies] * ally_alive_obs)
-        ally_dmg_penalty = (state.prev_ally_health - current_ally_hp) * 0.01 * 0.5
+        ally_dmg_penalty = (state.prev_ally_health - current_ally_hp) * weights["ally_damage"]
         
         # Kill Bonuses
-        enemy_killed = (jnp.sum(state.smax_state.unit_alive[self.num_allies:]) - jnp.sum(enemy_alive_obs)) * 0.2
+        enemy_killed = (jnp.sum(state.smax_state.unit_alive[self.num_allies:]) - jnp.sum(enemy_alive_obs)) * weights["enemy_kill"]
         
         # Total Reward (step-level)
         total_reward = nav_reward + combat_shaping + enemy_dmg_reward - ally_dmg_penalty + enemy_killed
@@ -603,11 +614,12 @@ class JaxSC2Env:
         allies_dead = jnp.sum(ally_alive_obs) == 0
         done = beacon_reached | enemies_dead | allies_dead | (state.timestep + 1 >= self.max_steps)
         
-        # Terminal Rewards (Panda et al., ICML 2026)
-        terminal_reward = jnp.where(beacon_reached, 25.0,
-            jnp.where(enemies_dead, 10.0,
-                jnp.where(allies_dead, -10.0,
-                    jnp.where(done, -15.0, 0.0))))
+        # Either objective earns the same terminal bonus in the balanced profile.
+        # Simultaneous victories receive one bonus, not a double payout.
+        terminal_reward = jnp.where(beacon_reached, weights["beacon_win"],
+            jnp.where(enemies_dead, weights["combat_win"],
+                jnp.where(allies_dead, weights["defeat"],
+                    jnp.where(done, weights["timeout"], 0.0))))
         total_reward = total_reward + terminal_reward
         
         # 11. Build Info
@@ -655,36 +667,21 @@ class JaxSC2Env:
             fog_state=next_fog_state,
             action_buffer=new_buffer,
             enemy_visible=new_visibility,
+            enemy_home=state.enemy_home,
+            enemy_alerted=enemy_orders.alerted,
             timestep=state.timestep + 1,
         )
         
         return self.get_obs(next_state), next_state, total_reward, done, info
 
     def get_enemy_actions(self, state: JaxSC2State, rng=None) -> jnp.ndarray:
-        """Encode movement toward allies (or a patrol direction) in four directions."""
-        enemy_alive = state.smax_state.unit_alive[self.num_allies:]  # (N_enemies,)
-        ally_pos = state.smax_state.unit_positions[:self.num_allies]
-        ally_alive = state.smax_state.unit_alive[:self.num_allies]
-        centroid = self._compute_centroid(ally_pos, ally_alive)
-        delta = centroid - state.smax_state.unit_positions[self.num_allies:]
-        goals = jnp.broadcast_to(centroid, (self.num_enemies, 2))
-        waypoint = self.map_instance.route_waypoints(
-            state.smax_state.unit_positions[self.num_allies:], goals,
-            self.map_width, self.map_height, self.unit_radius,
-        )
-        delta_move = waypoint - state.smax_state.unit_positions[self.num_allies:]
-        horizontal = jnp.abs(delta_move[:, 0]) > jnp.abs(delta_move[:, 1])
-        direction = jnp.where(horizontal, jnp.where(delta_move[:, 0] > 0, 1, 3),
-                              jnp.where(delta_move[:, 1] > 0, 0, 2))
-        nearby = jnp.linalg.norm(delta, axis=-1) < self.combat_cfg["aggression_radius"]
-        patrol = jnp.full(self.num_enemies, (state.timestep // 30) % 4, dtype=jnp.int32)
-        base_action = jnp.where(
-            self.mode_id == 3, direction,
-            jnp.where(self.mode_id == 2, patrol,
-                      jnp.where((self.mode_id == 1) & nearby, direction, 4)),
-        )
-        # Dead enemies stay
-        return jnp.where(enemy_alive, base_action, jnp.ones_like(base_action) * 4)
+        """Compatibility four-direction encoding; advanced orders also have targets."""
+        orders = self.get_enemy_orders(state, rng)
+        return jnp.where(orders.verb == 1, ((orders.direction + 1) // 2) % 4, 4)
+
+    def get_enemy_orders(self, state: JaxSC2State, rng=None):
+        """Per-enemy movement, target selection, and persistent ambush activation."""
+        return get_enemy_orders(self, state)
 
     def get_obs(self, state: JaxSC2State) -> Union[jnp.ndarray, Dict]:
         vector_obs = self.build_vector_obs(state)

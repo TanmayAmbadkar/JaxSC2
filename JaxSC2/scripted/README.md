@@ -30,7 +30,67 @@ conda run --no-capture-output -n twobridge env PYTHONPATH=. \
   --output runs/scripted_demo
 ```
 
-Use `--enemy-modes all` to cover static, guard, patrol, and aggressive opponents; `--seeds 0 42 123` for multiple layouts; `--render none` for metrics only. `--max-steps` explicitly changes the episode budget and is recorded in every result. Blue units are allies, red units are enemies, cyan is the beacon, and yellow marks projectiles. The rendered bridge openings match the movement constraints.
+Use `--enemy-modes all` to cover all eleven opponents listed below;
+`--seeds 0 42 123` for multiple layouts; `--render none` for metrics only.
+The full nine-variant, five-setting, eleven-mode matrix has 990 episodes per seed.
+`--max-steps` explicitly changes the episode budget and is recorded in every result.
+Blue units are allies, red units are enemies, cyan is the beacon, and yellow marks
+projectiles. The rendered bridge openings match the movement constraints.
+
+## Enemy modes
+
+Pass `enemy_ai=True, enemy_mode="..."` to `JaxSC2Env`, or use `--enemy-mode`
+in the PPO launcher and `--enemy-modes` in this evaluation tool.
+
+| Mode | Behavior |
+| --- | --- |
+| `static` | Stay in place; auto-attack enemies in range. |
+| `guard` | Approach the ally centroid when within the aggression radius. |
+| `patrol` | Cycle through four cardinal movement directions every 30 steps. |
+| `aggressive` | Chase the living allies' centroid, routing through bridges. |
+| `beacon_defender` | Assemble around the beacon; intercept nearby allies within a defensive leash. |
+| `bridge_blocker` | Split across both bridge exits on the original bank; hold positions and intercept nearby allies. |
+| `pursuer` | Chase individual exposed allies, favoring nearby, isolated, low-health targets. |
+| `kiter` | Melee units close in; ranged/tank units retreat when too close or during cooldown, respecting windup locks. |
+| `focus_fire` | Coordinate on one vulnerable ally; retarget when it dies. |
+| `ambusher` | Stage near the closest bridge exit; suppress attacks until a living sentry sees an ally, then latch into pursuit. |
+| `adaptive_defender` | Shift to the bridge nearest the current ally centroid; intercept local threats. |
+
+Controllers share the normal movement, inertia, terrain, collisions, weapon range,
+and attack-cycle mechanics. They do not teleport to defensive positions. Enemy
+controllers use full simulation state, like the original AI; `enable_fow` limits
+the player observation, not enemy perception. Ambush activation additionally
+requires proximity within the configured vision radius. There is no stealth or
+cover bonus. Adaptive defense is a reactive heuristic, not a learned strategy.
+
+Enemy home positions and ambush alerts are episode state, reset by `env.reset`.
+Advanced target selection is available through `env.get_enemy_orders(state)`;
+`get_enemy_actions` remains a four-direction movement-only compatibility view.
+Selecting one mode does not randomly mix modes between episodes.
+
+Render just the seven new modes (14 episodes):
+
+```bash
+conda run --no-capture-output -n twobridge env PYTHONPATH=. \
+  python -m JaxSC2.scripted.evaluate --variants V2_Base --settings baseline \
+  --enemy-modes beacon_defender bridge_blocker pursuer kiter focus_fire ambusher adaptive_defender \
+  --render all --output runs/scripted_combat_modes
+```
+
+Train a separate run against a selected opponent:
+
+```bash
+python examples/run_ppo.py --enemy-mode beacon_defender --reward-profile balanced \
+  --total-steps 30000000 --background
+```
+
+The mode and exact reward weights are saved in each run's configuration; changing
+the opponent is rejected when resuming an existing run.
+
+For a 600-step training/evaluation horizon, add `--max-episode-steps 600` to the
+PPO launcher. This is independent of `--rollout-len`: partial episode returns
+carry across rollouts. The horizon is saved in `config.json`; resume must use
+the original horizon as well as the same opponent and reward profile.
 
 ```python
 import jax

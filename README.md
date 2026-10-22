@@ -83,6 +83,24 @@ model = MaskPPO(config=config)
 model.train(env, total_steps=30_000_000)
 ```
 
+The default `balanced` reward profile gives both beacon progress and approach to
+the enemy centroid a coefficient of 2.0, and either victory a +25 terminal bonus.
+Damage rewards (+0.005/HP), damage penalties (-0.005/HP), kills (+0.2), defeat
+(-10), and timeout (-15) are unchanged. Either victory still ends the episode;
+equal objective weights do not guarantee equally frequent combat/navigation wins.
+Use `JaxSC2Env(..., reward_profile="legacy")` to reproduce the earlier rewards
+(combat approach 0.5, combat victory +10). See the [reward reference](JaxSC2/maps/README.md).
+
+For a fresh, isolated PPO comparison run:
+
+```bash
+python examples/run_ppo.py --reward-profile balanced --total-steps 30000000 --background
+```
+
+The launcher records the reward profile and exact weights in `config.json` and
+refuses to resume a run under different rewards. Older run configurations without
+a reward profile are treated as `legacy`; resume them with `--reward-profile legacy`.
+
 Training output reports mean **episode reward**: the sum of raw environment
 rewards through termination, averaged over episodes completed since the previous
 log. Partial episodes carry across rollouts; output is `n/a` until one completes.
@@ -114,6 +132,12 @@ Open `runs/scripted_evaluation/index.html` to compare the behavior. The beacon
 agent routes through bridges; the combat agent approaches known enemies and
 attacks within each unit's weapon range. See the [scripted agent guide](JaxSC2/scripted/README.md)
 for opponent modes, seeds, and focused evaluations.
+
+Eleven [enemy modes](JaxSC2/scripted/README.md#enemy-modes) are available:
+`static`, `guard`, `patrol`, `aggressive`, `beacon_defender`, `bridge_blocker`,
+`pursuer`, `kiter`, `focus_fire`, `ambusher`, and `adaptive_defender`.
+Choose one with `examples/run_ppo.py --enemy-mode MODE`, or compare modes using
+`python -m JaxSC2.scripted.evaluate --enemy-modes all --variants V2_Base --settings baseline`.
 
 Generate demo GIFs:
 ```bash
